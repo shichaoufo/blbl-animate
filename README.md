@@ -35,6 +35,10 @@
 
 - 评论区图片支持播放动图（GIF / 动画 WebP）
 - 弹幕支持显示大表情 / 行内表情
+- **多平台直播**（feature/multi-platform-live 分支）：侧边栏新增「斗鱼」「虎牙」两个入口，
+  直播列表、分区浏览、清晰度/线路选择、弹幕全部复用原有电视交互；接口实现参考
+  [PureLive](https://github.com/wzgrx/PureLive)（MIT）的斗鱼 / 虎牙站点适配移植。
+  详见 [多平台直播说明](#多平台直播说明)。
 
 ### 已回退（弹幕时间轴与出帧链）
 
@@ -82,10 +86,71 @@
 
 ## 功能概览
 
-- 侧边栏导航：搜索 / 推荐 / 分类 / 动态 / 直播 / 我的
+- 侧边栏导航：搜索 / 推荐 / 分类 / 动态 / 直播 / 斗鱼 / 虎牙 / 我的
 - 扫码登录入口
 - 视频播放：Media3(ExoPlayer)，支持分辨率/编码/倍速/字幕/弹幕等设置
 - 设置页：播放与弹幕偏好等
+
+## 多平台直播说明
+
+> 本节描述 `feature/multi-platform-live` 分支新增的能力，合入前可先行 review。
+
+### 功能范围
+
+- 侧边栏新增 **斗鱼**、**虎牙** 两个入口（与 B 站直播并列，互不影响）。
+- 每个平台都有：推荐直播流、一级/二级分区浏览、房间卡片列表、清晰度选择、线路选择、弹幕。
+- 斗鱼额外支持醒目留言（SuperChat，`comm_chatmsg`）；虎牙的留言板与礼物消息暂不展示。
+- 播放流为 FLV / HLS，由 Media3(ExoPlayer) 直接播放（B 站直播本身即 FLV，链路一致）。
+
+### 架构
+
+```
+core/live/
+├── LiveSite.kt        # 平台枚举（BILIBILI / DOUYU / HUYA）
+├── MultiLiveApi.kt    # 统一入口：按平台分发，返回与 B 站一致的模型
+├── DouyuApi.kt        # 斗鱼：分区/推荐/房间/播放地址（getEncryption + getH5PlayV1 签名）
+├── HuyaApi.kt         # 虎牙：分区/推荐/房间/播放地址（antiCode 模板签名）
+└── Tars.kt            # 虎牙弹幕/WUP 使用的 Tars 编解码
+feature/live/
+├── LiveDanmakuClient.kt   # 弹幕客户端统一接口
+├── DouyuDanmakuClient.kt  # 斗鱼弹幕（wss://danmuproxy.douyu.com:8506，STT 协议）
+├── HuyaDanmakuClient.kt   # 虎牙弹幕（wss://wsapi.huya.com，Tars 协议）
+└── LiveFragment.kt 等     # 原有 UI 增加 site 参数，B 站路径行为不变
+```
+
+UI 层（`LiveFragment` / `LiveGridFragment` / `LiveAreaIndexFragment` / `LiveAreaDetailFragment` /
+`LivePlayerActivity`）只依赖 `LiveSite` + `MultiLiveApi`，模型直接复用 `LiveRoomCard` /
+`LiveAreaParent` / `BiliApi.LivePlayUrl`，因此电视端的 D-pad 焦点管理、刷新、加载更多等行为
+与 B 站直播完全一致。清晰度 id 做了归一化：斗鱼 `rate 0`（原画）与虎牙 `iBitRate 0`（原画）
+都映射为 `10000`，清晰度弹窗里「原画」固定排最前。
+
+### 接口实现要点（均已实测验证）
+
+- **斗鱼**
+  - 分区 `m.douyu.com/api/cate/list`；推荐 `japi/weblist/apinc/allpage/6/<page>`；
+    分区房间 `gapi/rkc/directory/mixList/2_<area>/<page>`；房间信息 `betard/<rid>`。
+  - 播放地址：先取签名描述符 `wgapi/livenc/liveweb/websec/getEncryption?did=<did>`
+    （`did` 为进程级随机 32 位十六进制，缓存 5 分钟），再 POST
+    `lapi/live/getH5PlayV1/<rid>`，`auth = md5(md5^n(rand_str+key) + key + rid + tt)`。
+  - 弹幕：`wss://danmuproxy.douyu.com:8506`，二进制报文 + `key@=value/` STT 文本。
+- **虎牙**
+  - 分区 `live.cdn.huya.com/liveconfig/game/bussLive?bussType=<1|2|8|3>`（四个固定一级分区）；
+    推荐/分区房间 `www.huya.com/cache.php?m=LiveList&do=getLiveListByPage`；
+    房间信息 `mp.huya.com/cache.php?m=Live&do=profileRoom`。
+  - 播放地址：对 `sFlvAntiCode` / `sHlsAntiCode` 做模板签名
+    （`wsSecret = md5(fm 模板替换 $0=u, $1=streamName, $2=md5(seqid|ctype|t), $3=wsTime)`），
+    访客 uid 先尝试匿名登录，失败时用临时 uid（与 PureLive 的 `fallbackViewerUid` 一致）。
+  - 弹幕：`wss://wsapi.huya.com`，Tars 编码（命令 16 注册分组 / 20 心跳 / 7、22 下发）。
+
+### 已知限制
+
+- 斗鱼 / 虎牙为**匿名访客**模式：不登录，因此没有「我的关注」；付费房、密码房无法播放。
+- 虎牙未接入 WUP `getCdnTokenInfoEx` 原生令牌与 SuperChat 留言板（PureLive 中的增强路径），
+  首版使用房间自带 antiCode 的 Web 签名路径。
+- 播放地址有有效期（虎牙约 5 分钟、斗鱼视 URL `expire` 而定），长时间观看如遇断流，
+  重新选择一次清晰度/线路即可（会自动拉取新地址）。
+- 未在真机编译验证前请勿直接合入 main；建议在 Android Studio 打开后先构建 Debug 包实测
+  （斗鱼房间 793400、虎牙房间 998 均可用于验证）。
 
 ## 技术栈
 

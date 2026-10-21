@@ -11,6 +11,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import blbl.cat3399.core.api.BiliApi
+import blbl.cat3399.core.live.LiveSite
+import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import blbl.cat3399.core.ui.AppToast
@@ -34,6 +36,7 @@ class LiveAreaDetailFragment : Fragment() {
     private val areaId: Int by lazy { requireArguments().getInt(ARG_AREA_ID, 0) }
     private val parentTitle: String by lazy { requireArguments().getString(ARG_PARENT_TITLE).orEmpty() }
     private val areaTitle: String by lazy { requireArguments().getString(ARG_AREA_TITLE).orEmpty() }
+    private val site: LiveSite by lazy { LiveSite.fromKey(requireArguments().getString(ARG_SITE)) }
 
     private lateinit var adapter: LiveRoomAdapter
     private val loadedRoomIds = HashSet<Long>()
@@ -81,6 +84,7 @@ class LiveAreaDetailFragment : Fragment() {
                     pendingFocusFirstItem = false
                     startActivity(
                         Intent(requireContext(), LivePlayerActivity::class.java)
+                            .putExtra(LivePlayerActivity.EXTRA_SITE, site.key)
                             .putExtra(LivePlayerActivity.EXTRA_ROOM_ID, room.roomId)
                             .putExtra(LivePlayerActivity.EXTRA_TITLE, room.title)
                             .putExtra(LivePlayerActivity.EXTRA_UNAME, room.uname),
@@ -206,11 +210,19 @@ class LiveAreaDetailFragment : Fragment() {
         private const val ARG_PARENT_TITLE = "parent_title"
         private const val ARG_AREA_ID = "area_id"
         private const val ARG_AREA_TITLE = "area_title"
+        private const val ARG_SITE = "site"
 
-        fun newInstance(parentAreaId: Int, parentTitle: String, areaId: Int, areaTitle: String): LiveAreaDetailFragment =
+        fun newInstance(
+            site: LiveSite,
+            parentAreaId: Int,
+            parentTitle: String,
+            areaId: Int,
+            areaTitle: String,
+        ): LiveAreaDetailFragment =
             LiveAreaDetailFragment().apply {
                 arguments =
                     Bundle().apply {
+                        putString(ARG_SITE, site.key)
                         putInt(ARG_PARENT_AREA_ID, parentAreaId)
                         putString(ARG_PARENT_TITLE, parentTitle)
                         putInt(ARG_AREA_ID, areaId)
@@ -308,12 +320,21 @@ class LiveAreaDetailFragment : Fragment() {
             try {
                 val pageSize = 30
                 val fetched =
-                    BiliApi.liveAreaRooms(
-                        parentAreaId = parentAreaId,
-                        areaId = areaId,
-                        page = page,
-                        pageSize = pageSize,
-                    )
+                    if (site.isNative) {
+                        BiliApi.liveAreaRooms(
+                            parentAreaId = parentAreaId,
+                            areaId = areaId,
+                            page = page,
+                            pageSize = pageSize,
+                        )
+                    } else {
+                        MultiLiveApi.areaRooms(
+                            site = site,
+                            parentAreaId = parentAreaId,
+                            areaId = areaId,
+                            page = page,
+                        )
+                    }
                 if (token != requestToken) return@launch
                 if (fetched.isEmpty() || fetched.size < pageSize) endReached = true
                 val filtered = fetched.filter { loadedRoomIds.add(it.roomId) }

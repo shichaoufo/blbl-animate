@@ -1,6 +1,13 @@
 package blbl.cat3399.feature.live
 
-interface LiveNavigator {
-    fun openAreaDetail(parentAreaId: Int, parentTitle: String, areaId: Int, areaTitle: String): Boolean
-}
+import blbl.cat3399.core.live.LiveSite
 
+interface LiveNavigator {
+    fun openAreaDetail(
+        site: LiveSite,
+        parentAreaId: Int,
+        parentTitle: String,
+        areaId: Int,
+        areaTitle: String,
+    ): Boolean
+}

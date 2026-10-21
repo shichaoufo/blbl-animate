@@ -28,7 +28,7 @@ class LiveMessageClient(
     private val onSuperChat: (LiveSuperChat) -> Unit,
     private val onSuperChatDelete: (Set<Long>) -> Unit,
     private val onStatus: (String) -> Unit,
-) {
+) : LiveDanmakuClient {
     data class LiveDanmakuEvent(
         val text: String,
         val color: Int,
@@ -56,7 +56,7 @@ class LiveMessageClient(
     private var token: String = ""
     private var hosts: List<BiliApi.LiveDanmuHost> = emptyList()
 
-    suspend fun connect() {
+    override suspend fun connect() {
         closed = false
         reconnectAttempt = 0
         hostIndex = 0
@@ -79,7 +79,7 @@ class LiveMessageClient(
         return preferred + others
     }
 
-    fun close() {
+    override fun close() {
         closed = true
         heartbeatTask?.cancel(true)
         heartbeatTask = null

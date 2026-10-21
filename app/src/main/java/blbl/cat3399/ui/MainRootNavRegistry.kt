@@ -5,6 +5,7 @@ import androidx.annotation.DrawableRes
 import androidx.annotation.StringRes
 import androidx.fragment.app.Fragment
 import blbl.cat3399.R
+import blbl.cat3399.core.live.LiveSite
 import blbl.cat3399.core.prefs.AppPrefs
 import blbl.cat3399.core.net.BiliClient
 import blbl.cat3399.feature.category.CategoryFragment
@@ -73,8 +74,24 @@ object MainRootNavRegistry {
                 titleRes = R.string.tab_live,
                 iconRes = R.drawable.ic_nav_live,
                 startupPageKey = AppPrefs.STARTUP_PAGE_LIVE,
-                matchesFragment = { it is LiveFragment },
-                fragmentFactory = { LiveFragment.newInstance() },
+                matchesFragment = { it is LiveFragment && it.site == LiveSite.BILIBILI },
+                fragmentFactory = { LiveFragment.newInstance(LiveSite.BILIBILI) },
+            ),
+            RootNavSpec(
+                navId = SidebarNavAdapter.ID_DOUYU,
+                key = "live_douyu",
+                titleRes = R.string.tab_live_douyu,
+                iconRes = R.drawable.ic_nav_douyu,
+                matchesFragment = { it is LiveFragment && it.site == LiveSite.DOUYU },
+                fragmentFactory = { LiveFragment.newInstance(LiveSite.DOUYU) },
+            ),
+            RootNavSpec(
+                navId = SidebarNavAdapter.ID_HUYA,
+                key = "live_huya",
+                titleRes = R.string.tab_live_huya,
+                iconRes = R.drawable.ic_nav_huya,
+                matchesFragment = { it is LiveFragment && it.site == LiveSite.HUYA },
+                fragmentFactory = { LiveFragment.newInstance(LiveSite.HUYA) },
             ),
             RootNavSpec(
                 navId = SidebarNavAdapter.ID_CUSTOM,

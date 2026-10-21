@@ -36,6 +36,8 @@ import blbl.cat3399.BuildConfig
 import blbl.cat3399.R
 import blbl.cat3399.core.api.BiliApi
 import blbl.cat3399.core.api.BiliApiException
+import blbl.cat3399.core.live.LiveSite
+import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.model.Danmaku
 import blbl.cat3399.core.model.LiveSuperChat
@@ -187,6 +189,12 @@ class LivePlayerActivity : BaseActivity() {
     private var roomUname: String = ""
     private var roomFace: String? = null
 
+    /** 直播平台（B 站 / 斗鱼 / 虎牙）。 */
+    private val site: LiveSite by lazy { LiveSite.fromKey(intent.getStringExtra(EXTRA_SITE)) }
+
+    /** 虎牙弹幕注册分组需要的主播 uid（profileRoom 的 profileInfo.uid）。 */
+    private var presenterUid: Long = 0L
+
     private var session: LiveSession = LiveSession()
     private val debug = PlayerDebugMetrics()
     @Volatile private var liveHlsDebugInfo: LiveHlsDebugInfo? = null
@@ -195,7 +203,7 @@ class LivePlayerActivity : BaseActivity() {
     private var lastLiveStatus: Int = 0
     private var transientPlaybackResumeRequested: Boolean? = null
 
-    private var messageClient: LiveMessageClient? = null
+    private var messageClient: LiveDanmakuClient? = null
     private var liveDanmakuBaseUptimeMs: Long = 0L
     private var liveDanmakuLastAppendMs: Int = Int.MIN_VALUE
     private var temporarySuperChatPreviewStarted = false
@@ -1594,8 +1602,10 @@ class LivePlayerActivity : BaseActivity() {
     private suspend fun loadAndPlay(initial: Boolean) {
         val engine = player ?: return
         try {
-            val info = BiliApi.liveRoomInfo(roomId)
+            val info =
+                if (site.isNative) BiliApi.liveRoomInfo(roomId) else MultiLiveApi.roomInfo(site, roomId)
             realRoomId = info.roomId
+            presenterUid = info.uid
             lastLiveStatus = info.liveStatus
             updateLiveUpQuickCardOwner(info)
 
@@ -1606,14 +1616,19 @@ class LivePlayerActivity : BaseActivity() {
                     if (roomUname.isNotBlank()) append(" · ").append(roomUname)
                 }
 
-            val qn = session.targetQn.takeIf { it > 0 } ?: 150
-            val play = BiliApi.livePlayUrl(realRoomId, qn, highBitrateEnabled = session.highBitrateEnabled)
+            val qn = session.targetQn.takeIf { it > 0 } ?: MultiLiveApi.defaultQualityId(site)
+            val play =
+                if (site.isNative) {
+                    BiliApi.livePlayUrl(realRoomId, qn, highBitrateEnabled = session.highBitrateEnabled)
+                } else {
+                    MultiLiveApi.playUrl(site, realRoomId, qn, highBitrateEnabled = session.highBitrateEnabled)
+                }
             lastPlay = play
             if (play.lines.isNotEmpty()) {
                 // If saved lineOrder becomes out of range (API may return fewer lines), fall back to line 1.
                 val safeLineOrder = session.lineOrder.takeIf { it in 1..play.lines.size } ?: 1
                 if (safeLineOrder != session.lineOrder) session = session.copy(lineOrder = safeLineOrder)
-                if (session.originFailCount >= ORIGIN_FAIL_BEFORE_SIGNED) {
+                if (site.isNative && session.originFailCount >= ORIGIN_FAIL_BEFORE_SIGNED) {
                     val signedStartIndex =
                         play.lines.indexOfFirst { isSignedLiveUrl(it.url) }.let { idx ->
                             if (idx < 0) play.lines.size else idx.coerceIn(0, play.lines.size)
@@ -1638,20 +1653,24 @@ class LivePlayerActivity : BaseActivity() {
             engine.setSource(PlaybackSource.Live(url = pickedLine.url))
             engine.prepare()
             engine.playWhenReady = true
-            reportLiveRoomEntry(realRoomId)
+            if (site.isNative) reportLiveRoomEntry(realRoomId)
 
             if (initial) {
                 connectDanmaku()
-                startTemporarySuperChatPreview()
-                loadInitialSuperChats(realRoomId)
+                if (site.isNative) {
+                    startTemporarySuperChatPreview()
+                    loadInitialSuperChats(realRoomId)
+                }
             }
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
             resetBufferingOverlayState()
             AppLog.e("LivePlayer", "loadAndPlay failed", t)
             val e = t as? BiliApiException
-            val msg = e?.let { "B 站返回：${it.apiCode} / ${it.apiMessage}" } ?: (t.message ?: "未知错误")
-            AppToast.showLong(this, msg)
+            val msg =
+                e?.let { "B 站返回：${it.apiCode} / ${it.apiMessage}" }
+                    ?: (t.message ?: "未知错误")
+            AppToast.showLong(this, if (site.isNative) msg else "${site.displayName}：$msg")
         }
     }
 
@@ -1671,40 +1690,110 @@ class LivePlayerActivity : BaseActivity() {
         messageClient?.close()
         messageClient = null
         val rid = realRoomId.takeIf { it > 0 } ?: return
-        AppLog.i("LiveDanmaku", "connect room=$rid")
+        AppLog.i("LiveDanmaku", "connect site=${site.key} room=$rid")
 
         messageClient =
-            LiveMessageClient(
-                roomId = rid,
-                onDanmaku = { ev ->
-                    runOnUiThread(
-                        Runnable {
-                            appendLiveDanmakuEvent(ev)
+            when (site) {
+                LiveSite.DOUYU ->
+                    DouyuDanmakuClient(
+                        roomId = rid,
+                        onDanmaku = { ev ->
+                            runOnUiThread(
+                                Runnable {
+                                    appendLiveDanmakuEvent(ev)
+                                },
+                            )
+                        },
+                        onSuperChat = { ev ->
+                            runOnUiThread(
+                                Runnable {
+                                    superChatOverlay.submit(ev)
+                                },
+                            )
+                        },
+                        onSuperChatDelete = { ids ->
+                            runOnUiThread(
+                                Runnable {
+                                    superChatOverlay.delete(ids)
+                                },
+                            )
+                        },
+                        onStatus = { msg ->
+                            runOnUiThread(
+                                Runnable {
+                                    AppLog.d("LiveWs", msg)
+                                },
+                            )
                         },
                     )
-                },
-                onSuperChat = { ev ->
-                    runOnUiThread(
-                        Runnable {
-                            superChatOverlay.submit(ev)
+
+                LiveSite.HUYA ->
+                    HuyaDanmakuClient(
+                        roomId = rid,
+                        presenterUid = presenterUid,
+                        onDanmaku = { ev ->
+                            runOnUiThread(
+                                Runnable {
+                                    appendLiveDanmakuEvent(ev)
+                                },
+                            )
+                        },
+                        onSuperChat = { ev ->
+                            runOnUiThread(
+                                Runnable {
+                                    superChatOverlay.submit(ev)
+                                },
+                            )
+                        },
+                        onSuperChatDelete = { ids ->
+                            runOnUiThread(
+                                Runnable {
+                                    superChatOverlay.delete(ids)
+                                },
+                            )
+                        },
+                        onStatus = { msg ->
+                            runOnUiThread(
+                                Runnable {
+                                    AppLog.d("LiveWs", msg)
+                                },
+                            )
                         },
                     )
-                },
-                onSuperChatDelete = { ids ->
-                    runOnUiThread(
-                        Runnable {
-                            superChatOverlay.delete(ids)
+
+                LiveSite.BILIBILI ->
+                    LiveMessageClient(
+                        roomId = rid,
+                        onDanmaku = { ev ->
+                            runOnUiThread(
+                                Runnable {
+                                    appendLiveDanmakuEvent(ev)
+                                },
+                            )
+                        },
+                        onSuperChat = { ev ->
+                            runOnUiThread(
+                                Runnable {
+                                    superChatOverlay.submit(ev)
+                                },
+                            )
+                        },
+                        onSuperChatDelete = { ids ->
+                            runOnUiThread(
+                                Runnable {
+                                    superChatOverlay.delete(ids)
+                                },
+                            )
+                        },
+                        onStatus = { msg ->
+                            runOnUiThread(
+                                Runnable {
+                                    AppLog.d("LiveWs", msg)
+                                },
+                            )
                         },
                     )
-                },
-                onStatus = { msg ->
-                    runOnUiThread(
-                        Runnable {
-                            AppLog.d("LiveWs", msg)
-                        },
-                    )
-                },
-            )
+            }
 
         lifecycleScope.launch {
             runCatching { messageClient?.connect() }
@@ -2335,6 +2424,7 @@ class LivePlayerActivity : BaseActivity() {
         const val EXTRA_ROOM_ID = "room_id"
         const val EXTRA_TITLE = "title"
         const val EXTRA_UNAME = "uname"
+        const val EXTRA_SITE = "site"
 
         private const val EXTRA_ENGINE_SWITCH_SESSION_JSON = "engine_switch_session_json"
         private const val LIVE_QN_ORIGINAL = 10_000

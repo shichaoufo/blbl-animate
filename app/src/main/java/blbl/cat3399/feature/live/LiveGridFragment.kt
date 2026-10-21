@@ -11,6 +11,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import blbl.cat3399.core.api.BiliApi
+import blbl.cat3399.core.live.LiveSite
+import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.model.LiveRoomCard
 import blbl.cat3399.core.net.BiliClient
@@ -46,6 +48,7 @@ class LiveGridFragment : Fragment(), LivePageFocusTarget, RefreshKeyHandler {
     private val source: String by lazy { requireArguments().getString(ARG_SOURCE) ?: SRC_RECOMMEND }
     private val enableTabFocus: Boolean by lazy { requireArguments().getBoolean(ARG_ENABLE_TAB_FOCUS, true) }
     private val searchKeyword: String by lazy { requireArguments().getString(ARG_SEARCH_KEYWORD).orEmpty().trim() }
+    private val site: LiveSite by lazy { LiveSite.fromKey(requireArguments().getString(ARG_SITE)) }
 
     private val loadedRoomIds = HashSet<Long>()
     private val paging = PagedGridStateMachine(initialKey = 1)
@@ -80,6 +83,7 @@ class LiveGridFragment : Fragment(), LivePageFocusTarget, RefreshKeyHandler {
                     pendingRestoreAttemptsLeft = 24
                     startActivity(
                         Intent(requireContext(), LivePlayerActivity::class.java)
+                            .putExtra(LivePlayerActivity.EXTRA_SITE, site.key)
                             .putExtra(LivePlayerActivity.EXTRA_ROOM_ID, room.roomId)
                             .putExtra(LivePlayerActivity.EXTRA_TITLE, room.title)
                             .putExtra(LivePlayerActivity.EXTRA_UNAME, room.uname),
@@ -241,7 +245,12 @@ class LiveGridFragment : Fragment(), LivePageFocusTarget, RefreshKeyHandler {
                                         )
                                     }
                                 }
-                                else -> FetchedPage(items = BiliApi.liveRecommend(page = page), hasMore = null)
+                                else ->
+                                    if (site.isNative) {
+                                        FetchedPage(items = BiliApi.liveRecommend(page = page), hasMore = null)
+                                    } else {
+                                        FetchedPage(items = MultiLiveApi.recommendRooms(site, page), hasMore = null)
+                                    }
                             }
                         },
                         reduce = { page, fetched ->
@@ -594,20 +603,36 @@ class LiveGridFragment : Fragment(), LivePageFocusTarget, RefreshKeyHandler {
         private const val ARG_SOURCE = "source"
         private const val ARG_ENABLE_TAB_FOCUS = "enable_tab_focus"
         private const val ARG_SEARCH_KEYWORD = "search_keyword"
+        private const val ARG_SITE = "site"
 
         const val SRC_RECOMMEND = "recommend"
         const val SRC_FOLLOWING = "following"
         const val SRC_SEARCH = "search"
 
-        fun newRecommend() = LiveGridFragment().apply { arguments = Bundle().apply { putString(ARG_SOURCE, SRC_RECOMMEND) } }
-
-        fun newFollowing() = LiveGridFragment().apply { arguments = Bundle().apply { putString(ARG_SOURCE, SRC_FOLLOWING) } }
-
-        fun newSearch(keyword: String) = LiveGridFragment().apply {
-            arguments = Bundle().apply {
-                putString(ARG_SOURCE, SRC_SEARCH)
-                putString(ARG_SEARCH_KEYWORD, keyword.trim())
+        fun newRecommend(site: LiveSite = LiveSite.BILIBILI) =
+            LiveGridFragment().apply {
+                arguments = Bundle().apply {
+                    putString(ARG_SOURCE, SRC_RECOMMEND)
+                    putString(ARG_SITE, site.key)
+                }
             }
-        }
+
+        fun newFollowing(site: LiveSite = LiveSite.BILIBILI) =
+            LiveGridFragment().apply {
+                arguments = Bundle().apply {
+                    putString(ARG_SOURCE, SRC_FOLLOWING)
+                    putString(ARG_SITE, site.key)
+                }
+            }
+
+        fun newSearch(keyword: String, site: LiveSite = LiveSite.BILIBILI) =
+            LiveGridFragment().apply {
+                arguments =
+                    Bundle().apply {
+                        putString(ARG_SOURCE, SRC_SEARCH)
+                        putString(ARG_SEARCH_KEYWORD, keyword.trim())
+                        putString(ARG_SITE, site.key)
+                    }
+            }
     }
 }

@@ -10,6 +10,8 @@
     <string name="tab_category">分类</string>
     <string name="tab_dynamic">动态</string>
     <string name="tab_live">直播</string>
+    <string name="tab_live_douyu">斗鱼</string>
+    <string name="tab_live_huya">虎牙</string>
     <string name="tab_custom">自定义</string>
     <string name="tab_my">我的</string>
     <string name="custom_page_empty">当前没有可用内容</string>

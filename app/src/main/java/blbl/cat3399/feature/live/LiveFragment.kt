@@ -8,7 +8,10 @@ import android.view.View
 import android.view.ViewGroup
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentManager
+import androidx.lifecycle.lifecycleScope
 import androidx.viewpager2.adapter.FragmentStateAdapter
+import blbl.cat3399.core.live.LiveSite
+import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import blbl.cat3399.core.prefs.AppPrefs
@@ -25,8 +28,12 @@ import blbl.cat3399.ui.RefreshKeyHandler
 import blbl.cat3399.ui.SidebarFocusHost
 import com.google.android.material.tabs.TabLayout
 import com.google.android.material.tabs.TabLayoutMediator
+import kotlinx.coroutines.launch
 
 class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, LiveNavigator {
+    /** 当前直播平台（B 站 / 斗鱼 / 虎牙）。 */
+    internal val site: LiveSite by lazy { LiveSite.fromKey(requireArguments().getString(ARG_SITE)) }
+
     private var _binding: FragmentLiveBinding? = null
     private val binding get() = _binding!!
 
@@ -52,6 +59,7 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
         }
 
     private var tabs: List<LiveTab> = emptyList()
+    private var externalTabs: List<LiveTab>? = null
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         _binding = FragmentLiveBinding.inflate(inflater, container, false)
@@ -59,7 +67,13 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        setTabs(LiveTabs.visibleTabs(BiliClient.prefs, isLoggedIn = BiliClient.cookies.hasSessData()), force = true)
+        if (site.isNative) {
+            setTabs(LiveTabs.visibleTabs(BiliClient.prefs, isLoggedIn = BiliClient.cookies.hasSessData()), force = true)
+        } else {
+            // 斗鱼 / 虎牙：分区来自平台接口，先展示「推荐」，拉到分区后再补充分区 tab。
+            externalTabs?.let { setTabs(it, force = true) } ?: setTabs(listOf(LiveTab.recommend()), force = true)
+            loadExternalTabs()
+        }
         backStackListener =
             FragmentManager.OnBackStackChangedListener {
                 val showDetail = updateDetailVisibility()
@@ -70,10 +84,39 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
 
     override fun onResume() {
         super.onResume()
-        setTabs(LiveTabs.visibleTabs(BiliClient.prefs, isLoggedIn = BiliClient.cookies.hasSessData()))
+        if (site.isNative) {
+            setTabs(LiveTabs.visibleTabs(BiliClient.prefs, isLoggedIn = BiliClient.cookies.hasSessData()))
+        } else {
+            externalTabs?.let { setTabs(it) }
+        }
     }
 
-    override fun openAreaDetail(parentAreaId: Int, parentTitle: String, areaId: Int, areaTitle: String): Boolean {
+    private fun loadExternalTabs() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            val parents =
+                runCatching { MultiLiveApi.parents(site) }
+                    .onFailure { AppLog.w("Live", "load external parents failed site=${site.key}", it) }
+                    .getOrDefault(emptyList())
+            val next =
+                buildList {
+                    add(LiveTab.recommend())
+                    parents
+                        .filter { it.id > 0 && it.name.isNotBlank() }
+                        .forEach { add(LiveTab.area(parentId = it.id, title = it.name)) }
+                }
+            if (_binding == null) return@launch
+            externalTabs = next
+            setTabs(next, force = true)
+        }
+    }
+
+    override fun openAreaDetail(
+        site: LiveSite,
+        parentAreaId: Int,
+        parentTitle: String,
+        areaId: Int,
+        areaTitle: String,
+    ): Boolean {
         if (_binding == null || childFragmentManager.isStateSaved) return false
         pendingRestoreFocusAfterDetailReturn = true
         childFragmentManager.beginTransaction()
@@ -81,6 +124,7 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
             .replace(
                 binding.detailContainer.id,
                 LiveAreaDetailFragment.newInstance(
+                    site = site,
                     parentAreaId = parentAreaId,
                     parentTitle = parentTitle,
                     areaId = areaId,
@@ -137,7 +181,7 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
         tabs = next
 
         val b = binding
-        b.viewPager.adapter = LivePagerAdapter(this, tabs)
+        b.viewPager.adapter = LivePagerAdapter(this, site, tabs)
         mediator =
             TabLayoutMediator(b.tabLayout, b.viewPager) { tab, position ->
                 tab.text = tabs.getOrNull(position)?.title ?: ""
@@ -298,6 +342,13 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
         val parentId: Int?,
     ) {
         enum class Kind { RECOMMEND, FOLLOWING, AREA }
+
+        companion object {
+            fun recommend() = LiveTab(key = LiveTabs.KEY_RECOMMEND, title = "推荐", kind = Kind.RECOMMEND, parentId = null)
+
+            fun area(parentId: Int, title: String) =
+                LiveTab(key = LiveTabs.areaKey(parentId), title = title, kind = Kind.AREA, parentId = parentId)
+        }
     }
 
     object LiveTabs {
@@ -330,11 +381,12 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
             return all.filter { it.kind != LiveTab.Kind.FOLLOWING || isLoggedIn }
         }
 
-        private fun areaKey(parentId: Int): String = KEY_AREA_PREFIX + parentId
+        internal fun areaKey(parentId: Int): String = KEY_AREA_PREFIX + parentId
     }
 
     private class LivePagerAdapter(
         fragment: Fragment,
+        private val site: LiveSite,
         private val tabs: List<LiveTab>,
     ) : FragmentStateAdapter(fragment) {
         override fun getItemCount(): Int = tabs.size
@@ -343,9 +395,9 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
             val tab = tabs[position]
             AppLog.d("Live", "createFragment pos=$position title=${tab.title} kind=${tab.kind} pid=${tab.parentId} t=${SystemClock.uptimeMillis()}")
             return when (tab.kind) {
-                LiveTab.Kind.RECOMMEND -> LiveGridFragment.newRecommend()
-                LiveTab.Kind.FOLLOWING -> LiveGridFragment.newFollowing()
-                LiveTab.Kind.AREA -> LiveAreaIndexFragment.newInstance(parentAreaId = tab.parentId ?: 0, parentTitle = tab.title)
+                LiveTab.Kind.RECOMMEND -> LiveGridFragment.newRecommend(site)
+                LiveTab.Kind.FOLLOWING -> LiveGridFragment.newFollowing(site)
+                LiveTab.Kind.AREA -> LiveAreaIndexFragment.newInstance(site = site, parentAreaId = tab.parentId ?: 0, parentTitle = tab.title)
             }
         }
 
@@ -355,6 +407,14 @@ class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, L
     }
 
     companion object {
-        fun newInstance() = LiveFragment()
+        private const val ARG_SITE = "site"
+
+        fun newInstance(site: LiveSite = LiveSite.BILIBILI) =
+            LiveFragment().apply {
+                arguments =
+                    Bundle().apply {
+                        putString(ARG_SITE, site.key)
+                    }
+            }
     }
 }

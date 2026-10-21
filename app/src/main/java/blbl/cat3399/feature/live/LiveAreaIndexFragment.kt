@@ -9,6 +9,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import blbl.cat3399.core.api.BiliApi
+import blbl.cat3399.core.live.LiveSite
+import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import blbl.cat3399.core.ui.AppToast
@@ -33,6 +35,7 @@ class LiveAreaIndexFragment : Fragment(), LivePageFocusTarget, LivePageReturnFoc
 
     private val parentAreaId: Int by lazy { requireArguments().getInt(ARG_PARENT_AREA_ID, 0) }
     private val parentTitle: String by lazy { requireArguments().getString(ARG_PARENT_TITLE).orEmpty() }
+    private val site: LiveSite by lazy { LiveSite.fromKey(requireArguments().getString(ARG_SITE)) }
 
     private var initialLoadTriggered: Boolean = false
     private var requestToken: Int = 0
@@ -61,6 +64,7 @@ class LiveAreaIndexFragment : Fragment(), LivePageFocusTarget, LivePageReturnFoc
                         return@LiveAreaAdapter
                     }
                     nav.openAreaDetail(
+                        site = site,
                         parentAreaId = parentAreaId,
                         parentTitle = parentTitle,
                         areaId = area.id,
@@ -149,7 +153,8 @@ class LiveAreaIndexFragment : Fragment(), LivePageFocusTarget, LivePageReturnFoc
         val token = ++requestToken
         viewLifecycleOwner.lifecycleScope.launch {
             try {
-                val parents = BiliApi.liveAreas(force = force)
+                val parents =
+                    if (site.isNative) BiliApi.liveAreas(force = force) else MultiLiveApi.parents(site)
                 if (token != requestToken) return@launch
                 val pickedParent = parents.firstOrNull { it.id == parentAreaId }
                 val children =
@@ -430,11 +435,13 @@ class LiveAreaIndexFragment : Fragment(), LivePageFocusTarget, LivePageReturnFoc
     companion object {
         private const val ARG_PARENT_AREA_ID = "parent_area_id"
         private const val ARG_PARENT_TITLE = "parent_title"
+        private const val ARG_SITE = "site"
 
-        fun newInstance(parentAreaId: Int, parentTitle: String): LiveAreaIndexFragment =
+        fun newInstance(site: LiveSite, parentAreaId: Int, parentTitle: String): LiveAreaIndexFragment =
             LiveAreaIndexFragment().apply {
                 arguments =
                     Bundle().apply {
+                        putString(ARG_SITE, site.key)
                         putInt(ARG_PARENT_AREA_ID, parentAreaId)
                         putString(ARG_PARENT_TITLE, parentTitle)
                     }
