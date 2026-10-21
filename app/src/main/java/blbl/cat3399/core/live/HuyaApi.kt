@@ -64,27 +64,25 @@ internal object HuyaApi {
      */
     private suspend fun ensureViewerUid(): Long {
         viewerUid.takeIf { it > 0 }?.let { return it }
-        synchronized(this) {
-            viewerUid.takeIf { it > 0 }?.let { return it }
-            val anonymous =
-                runCatching {
-                    val json =
-                        BiliClient.getJson(
-                            "https://udblgn.huya.com/web/anonymousLogin",
-                            headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "$WEB/"),
-                            noCookies = true,
-                        )
-                    json.optJSONObject("data")?.optLong("uid", 0) ?: 0
-                }.getOrDefault(0)
-            val uid =
-                if (anonymous > 0) {
-                    anonymous
-                } else {
-                    1_400_000_000_000L + Random.nextInt(1_000_000) * 100_000L + Random.nextInt(100_000)
-                }
-            viewerUid = uid
-            return uid
-        }
+        val anonymous = runCatching { fetchAnonymousUid() }.getOrDefault(0)
+        val uid =
+            if (anonymous > 0) {
+                anonymous
+            } else {
+                1_400_000_000_000L + Random.nextInt(1_000_000) * 100_000L + Random.nextInt(100_000)
+            }
+        synchronized(this) { viewerUid = uid }
+        return uid
+    }
+
+    private suspend fun fetchAnonymousUid(): Long {
+        val json =
+            BiliClient.getJson(
+                "https://udblgn.huya.com/web/anonymousLogin",
+                headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "$WEB/"),
+                noCookies = true,
+            )
+        return json.optJSONObject("data")?.optLong("uid", 0) ?: 0
     }
 
     // ---------------------------------------------------------------- 分区

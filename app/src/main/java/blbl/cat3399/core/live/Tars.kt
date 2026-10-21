@@ -2,6 +2,7 @@ package blbl.cat3399.core.live
 
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 
 /**
@@ -174,7 +175,7 @@ internal object Tars {
                     bytes.copyOfRange(start, start + len)
                 }
                 TYPE_LIST -> {
-                    val len = readIntValue()
+                    val len = readIntValue().toInt()
                     val items = ArrayList<Any?>(len)
                     // 列表元素依次排列；用元素的头部判断类型，struct 元素读到 STRUCT_END 为止。
                     for (i in 0 until len) {
@@ -205,7 +206,7 @@ internal object Tars {
                             ((bytes[pos + 1].toInt() and 0xFF) shl 16) or
                             ((bytes[pos + 2].toInt() and 0xFF) shl 8) or
                             (bytes[pos + 3].toInt() and 0xFF)
-                    else -> readIntValue()
+                    else -> readIntValue().toInt()
                 }
             pos += lenBytes
             return v

@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 /**
@@ -78,7 +79,7 @@ internal object DouyuApi {
     private var descriptorCache: Descriptor? = null
 
     /** `auth = md5(rand_str 连加 key 哈希 enc_time 次 + key + rid + tt)`（is_special 时不加 rid/tt）。 */
-    internal fun auth(roomId: Long, tt: Long, d: Descriptor): String {
+    private fun auth(roomId: Long, tt: Long, d: Descriptor): String {
         var secret = d.randStr
         val rounds = d.encTime.coerceIn(1, 16)
         for (i in 0 until rounds) {
