@@ -4,6 +4,7 @@ import android.util.Base64
 import blbl.cat3399.core.api.BiliApi
 import blbl.cat3399.core.model.LiveAreaParent
 import blbl.cat3399.core.model.LiveRoomCard
+import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -52,6 +53,9 @@ internal object HuyaApi {
     const val QUALITY_SOURCE = 10_000
 
     private const val PROFILE_CACHE_TTL_MS = 3_000L
+
+    /** native 凭据缓存时长：凭据本身 5 分钟有效，留 1 分钟余量。 */
+    private const val NATIVE_TOKEN_TTL_MS = 4 * 60 * 1000L
 
     // ---------------------------------------------------------------- 访客 uid
 
@@ -278,8 +282,18 @@ internal object HuyaApi {
                 val antiCode = base.optString(if (isHls) "sHlsAntiCode" else "sFlvAntiCode")
                 val streamName = base.optString("sStreamName").trim()
                 if (baseUrl.isBlank() || streamName.isBlank()) continue
+                // FLV 优先用 native 凭据：web antiCode 签出的地址在连接建立约 120 秒后被 CDN
+                // 主动断开（实测 120.8s，正常 EOF、不报错），native 凭据只约束新建连接，
+                // 不会掐断已建立的连接（实测 210s 无 EOF）。
                 val url =
-                    runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, isHls) }.getOrNull() ?: continue
+                    (
+                        if (isHls) {
+                            runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, true) }.getOrNull()
+                        } else {
+                            nativeFlvUrl(baseUrl, streamName, bitRate)
+                                ?: runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, false) }.getOrNull()
+                        }
+                    ) ?: continue
                 if (seen.add(url)) {
                     lines.add(BiliApi.LivePlayLine(order = lines.size + 1, url = url))
                 }
@@ -293,6 +307,49 @@ internal object HuyaApi {
             qnDesc = qualities.toMap(),
             lines = lines,
         )
+    }
+
+    // ---------------------------------------------------------------- native 凭据
+
+    /** native 凭据缓存：同一条流只取一次。失败不缓存，下次调用会重试。 */
+    @Volatile
+    private var nativeToken: Pair<String, String>? = null
+
+    @Volatile
+    private var nativeTokenFetchedAtMs = 0L
+
+    /**
+     * 用 native 凭据拼 FLV 地址（`ctype=huya_pc_exe`）。
+     *
+     * 注意：`sFlvToken` 本身就是完整的 query，**不能**再走 [signAntiCode] 二次签名——
+     * 那样算出的 wsSecret 与服务端不一致，CDN 直接 403（实测）。
+     */
+    private suspend fun nativeFlvUrl(
+        baseUrl: String,
+        streamName: String,
+        bitRate: Int,
+    ): String? {
+        val token = nativeTokenFor(streamName) ?: return null
+        var query = token
+        if (!Regex("(^|&)codec=").containsMatchIn(query)) query = "$query&codec=264"
+        query = replaceQueryParameter(query, "ratio", if (bitRate > 0) bitRate.toString() else null)
+        return "${baseUrl.trimEnd('/')}/$streamName.flv?$query"
+    }
+
+    private suspend fun nativeTokenFor(streamName: String): String? {
+        val now = System.currentTimeMillis()
+        nativeToken?.let { (name, token) ->
+            if (name == streamName && now - nativeTokenFetchedAtMs < NATIVE_TOKEN_TTL_MS) return token
+        }
+        val token = HuyaWupToken.fetch(streamName)
+        if (token.isNullOrBlank()) {
+            AppLog.w("HuyaToken", "native token unavailable, fallback to web antiCode ${streamName.take(24)}")
+            return null
+        }
+        nativeToken = streamName to token
+        nativeTokenFetchedAtMs = now
+        AppLog.i("HuyaToken", "native token ready ${streamName.take(24)} len=${token.length}")
+        return token
     }
 
     private fun findBase(bases: JSONArray, cdnType: String): JSONObject? {
