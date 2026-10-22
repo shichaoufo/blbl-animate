@@ -290,7 +290,10 @@ internal object HuyaApi {
                         if (isHls) {
                             runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, true) }.getOrNull()
                         } else {
-                            nativeFlvUrl(baseUrl, streamName, bitRate)
+                            // 只给第一条线路用 native：既拿到「不会被掐断」的那条，又保留其余
+                            // 线路的 web 签名，万一 native 凭据被服务端作废，自动换线仍能播。
+                            val native = if (lines.isEmpty()) nativeFlvUrl(baseUrl, streamName, bitRate) else null
+                            native
                                 ?: runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, false) }.getOrNull()
                         }
                     ) ?: continue
@@ -336,10 +339,20 @@ internal object HuyaApi {
         return "${baseUrl.trimEnd('/')}/$streamName.flv?$query"
     }
 
+    /** 凭据里的 `wsTime` 是十六进制秒；超过 240 秒即视为接近过期。 */
+    private fun tokenExpired(token: String): Boolean {
+        val raw = Regex("(^|&)wsTime=([0-9a-fA-F]+)").find(token)?.groupValues?.get(2) ?: return false
+        val seconds = raw.toLongOrNull(16) ?: return false
+        return System.currentTimeMillis() / 1000 > seconds + 240
+    }
+
     private suspend fun nativeTokenFor(streamName: String): String? {
         val now = System.currentTimeMillis()
         nativeToken?.let { (name, token) ->
-            if (name == streamName && now - nativeTokenFetchedAtMs < NATIVE_TOKEN_TTL_MS) return token
+            // 缓存有效，且凭据本身没接近过期（wsTime + 240s）才复用。
+            if (name == streamName && now - nativeTokenFetchedAtMs < NATIVE_TOKEN_TTL_MS && !tokenExpired(token)) {
+                return token
+            }
         }
         val token = HuyaWupToken.fetch(streamName)
         if (token.isNullOrBlank()) {
