@@ -38,6 +38,7 @@ import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.ParsingLoadable
 import blbl.cat3399.core.api.video.VideoMediaRequestProfile
+import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import blbl.cat3399.feature.player.AudioBalanceLevel
@@ -45,6 +46,11 @@ import blbl.cat3399.feature.player.CdnFailoverDataSourceFactory
 import blbl.cat3399.feature.player.CdnFailoverState
 import blbl.cat3399.feature.player.DebugStreamKind
 import blbl.cat3399.feature.player.Playable
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -98,6 +104,24 @@ internal class ExoPlayerEngine(
             .build()
 
     private val listeners: MutableSet<BlblPlayerEngine.Listener> = CopyOnWriteArraySet()
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /** 当前播放源：直播续流时要知道原始地址（用来匹配同一条 CDN 线路）。 */
+    @Volatile
+    private var currentSource: PlaybackSource? = null
+
+    /**
+     * 直播续流状态。
+     *
+     * 直播地址都带时限：虎牙 web FLV 的连接租约实测约 120 秒（签名 `wsTime + 300s` 到期之前
+     * CDN 就会主动断开），断流时 ExoPlayer 只收到正常 EOF 并进入 STATE_ENDED，**不报错**，
+     * 用户看到的就是「看着看着停住」。这里在 ENDED 时重新签一次地址再 prepare，续上直播。
+     */
+    private var liveReconnectCount = 0
+    private var liveReconnectWindowStartMs = 0L
+    private var liveReconnectInFlight = false
+
     private var seamlessQualitySource: Boolean = false
     private var seamlessAvailableQns: Set<Int> = emptySet()
     private var seamlessAvailableTracks: Set<Pair<Int, Int>> = emptySet()
@@ -224,6 +248,7 @@ internal class ExoPlayerEngine(
                 }
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_ENDED) maybeReconnectLive()
                     listeners.forEach { it.onPlaybackStateChanged(playbackState) }
                 }
 
@@ -299,6 +324,7 @@ internal class ExoPlayerEngine(
     }
 
     override fun setSource(source: PlaybackSource) {
+        currentSource = source
         AppLog.i(
             "QualitySwitch",
             "setSource type=${source.javaClass.simpleName} seamlessRequested=${(source as? PlaybackSource.Vod)?.seamlessQualitySwitchEnabled == true} " +
@@ -390,7 +416,52 @@ internal class ExoPlayerEngine(
     }
 
     override fun release() {
+        scope.cancel()
         exoPlayer.release()
+    }
+
+    /**
+     * 直播续流：只在直播源正常结束（EOF）时触发。
+     *
+     * 重新取一次播放地址（同站点 / 同房间 / 同清晰度，优先保留同一条 CDN 线路）再 prepare
+     * 一次，从最新直播位置继续，避免「每 2 分钟停一次」。5 分钟内最多重连 8 次，地址长期
+     * 不可用时不至于原地打转。
+     */
+    private fun maybeReconnectLive() {
+        val source = currentSource as? PlaybackSource.Live ?: return
+        if (liveReconnectInFlight) return
+        val now = SystemClock.elapsedRealtime()
+        if (liveReconnectWindowStartMs <= 0L || now - liveReconnectWindowStartMs > LIVE_RECONNECT_WINDOW_MS) {
+            liveReconnectWindowStartMs = now
+            liveReconnectCount = 0
+        }
+        if (liveReconnectCount >= LIVE_RECONNECT_MAX) {
+            AppLog.w("LiveReconnect", "give up after $liveReconnectCount reconnects")
+            return
+        }
+        liveReconnectCount++
+        liveReconnectInFlight = true
+        val previousUrl = source.url
+        AppLog.i("LiveReconnect", "stream ended, refreshing url (${liveReconnectCount})")
+        scope.launch {
+            try {
+                val fresh = runCatching { MultiLiveApi.refreshLastPlayUrl() }.getOrNull()
+                val previousPath = previousUrl.substringBefore('?')
+                val nextUrl =
+                    fresh
+                        ?.lines
+                        ?.firstOrNull { it.url.substringBefore('?') == previousPath }
+                        ?.url
+                        ?: fresh?.lines?.firstOrNull()?.url
+                        ?: previousUrl
+                if (nextUrl.isBlank()) return@launch
+                setSource(PlaybackSource.Live(url = nextUrl))
+                exoPlayer.prepare()
+                exoPlayer.play()
+            } finally {
+                liveReconnectInFlight = false
+            }
+        }
     }
 
     override fun addListener(listener: BlblPlayerEngine.Listener) {
@@ -878,6 +949,10 @@ private fun parseLiveHlsAuxBytes(auxRaw: String?): Long? {
 }
 
 private const val LIVE_HLS_DEBUG_RECENT_SEGMENT_COUNT = 3
+
+/** 直播续流窗口：这段时间内最多重连 [LIVE_RECONNECT_MAX] 次。 */
+private const val LIVE_RECONNECT_WINDOW_MS = 5 * 60 * 1000L
+private const val LIVE_RECONNECT_MAX = 8
 
 private class BlblRenderersFactory(
     context: Context,
