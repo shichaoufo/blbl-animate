@@ -340,13 +340,33 @@ internal object HuyaApi {
         for (seg in query.split("&")) {
             if (seg.isBlank()) continue
             val idx = seg.indexOf('=')
-            val k = if (idx >= 0) seg.substring(0, idx) else seg
-            val v = if (idx >= 0) seg.substring(idx + 1) else ""
+            val k = decodeComponent(if (idx >= 0) seg.substring(0, idx) else seg)
+            val v = decodeComponent(if (idx >= 0) seg.substring(idx + 1) else "")
             if (k.isBlank()) continue
             if (k !in values) keys.add(k)
             values[k] = v
         }
         return Params(keys, values)
+    }
+
+    /**
+     * antiCode 的值是 URL 编码过的：`fm` 的 Base64 填充位会写成 `%3D%3D`。
+     * 不解码直接交给 Base64 会抛 "Incorrect padding"，签名静默失败、返回未签名
+     * 的地址，CDN 就会回 403。`+` 在 query 里是 Base64 字符而不是空格，先转义掉。
+     */
+    private fun decodeComponent(value: String): String =
+        runCatching { java.net.URLDecoder.decode(value.replace("+", "%2B"), "UTF-8") }.getOrDefault(value)
+
+    /**
+     * `fm` 是含 `$0`~`$3` 占位符的 Base64 模板。服务端给的形式不固定（可能缺填充、
+     * 可能用 URL-safe 字母表），这里先归一化补齐再解码，避免一次解码失败就退化成
+     * 未签名地址。
+     */
+    private fun decodeFmTemplate(fm: String): String? {
+        val normalized = fm.trim().replace('-', '+').replace('_', '/')
+        if (normalized.isBlank()) return null
+        val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+        return runCatching { String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8) }.getOrNull()
     }
 
     /** `u = rotl64(uid)`：低 32 位左旋 8 位，高 32 位不变（PureLive REG-HUYA-008）。 */
@@ -371,7 +391,8 @@ internal object HuyaApi {
             error("$SITE antiCode expired (wsTime=$wsTime)")
         }
         val template =
-            runCatching { String(Base64.decode(fm, Base64.DEFAULT), Charsets.UTF_8) }.getOrNull() ?: return antiCode
+            decodeFmTemplate(fm)
+                ?: error("$SITE antiCode: fm is not a base64 template (an unsigned url would 403)")
         if (!template.contains("\$0") || !template.contains("\$1") || !template.contains("\$2") || !template.contains("\$3")) {
             return antiCode
         }
