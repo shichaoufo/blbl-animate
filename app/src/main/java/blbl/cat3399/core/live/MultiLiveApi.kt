@@ -61,8 +61,9 @@ internal object MultiLiveApi {
         roomId: Long,
         qualityId: Int,
         highBitrateEnabled: Boolean = false,
-    ): BiliApi.LivePlayUrl =
-        when (site) {
+    ): BiliApi.LivePlayUrl {
+        lastPlayUrlCall = LastPlayUrlCall(site, roomId, qualityId, highBitrateEnabled)
+        return when (site) {
             LiveSite.DOUYU -> DouyuApi.playUrl(roomId, qualityId)
             LiveSite.HUYA -> HuyaApi.playUrl(roomId, qualityId)
             LiveSite.BILIBILI ->
@@ -72,6 +73,32 @@ internal object MultiLiveApi {
                     highBitrateEnabled = highBitrateEnabled,
                 )
         }
+    }
+
+    // ---------------------------------------------------------------- 直播续流
+
+    /**
+     * 最近一次 [playUrl] 的入参。
+     *
+     * 直播地址都带时限：虎牙 web FLV 的连接租约实测约 120 秒（签名 `wsTime + 300s` 之前
+     * CDN 就会主动断开），断流时播放器只收到正常 EOF，不报错，表现成「看着看着停住」。
+     * 播放器层拿不到房间信息，所以由这里记下最近一次请求，续流时按同样的参数重新签一次。
+     */
+    private data class LastPlayUrlCall(
+        val site: LiveSite,
+        val roomId: Long,
+        val qualityId: Int,
+        val highBitrateEnabled: Boolean,
+    )
+
+    @Volatile
+    private var lastPlayUrlCall: LastPlayUrlCall? = null
+
+    /** 重新获取最近一次 [playUrl] 的结果；从未调用过 [playUrl] 时返回 null。 */
+    suspend fun refreshLastPlayUrl(): BiliApi.LivePlayUrl? {
+        val call = lastPlayUrlCall ?: return null
+        return playUrl(call.site, call.roomId, call.qualityId, call.highBitrateEnabled)
+    }
 
     /** 未选择清晰度时的默认清晰度 id。 */
     fun defaultQualityId(site: LiveSite): Int =
