@@ -69,8 +69,12 @@ class HuyaDanmakuClient(
         val req =
             Request.Builder()
                 .url(ENDPOINT)
+                // 不能用 apiOkHttp：它的拦截器会注入 B 站 UA/Origin/Referer。
+                .header("User-Agent", USER_AGENT)
+                .header("Origin", WEB)
+                .header("Referer", "$WEB/")
                 .build()
-        ws = BiliClient.apiOkHttp.newWebSocket(req, Listener())
+        ws = BiliClient.liveDanmakuOkHttp.newWebSocket(req, Listener())
     }
 
     override fun close() {
@@ -225,6 +229,12 @@ class HuyaDanmakuClient(
 
     companion object {
         private const val ENDPOINT = "wss://wsapi.huya.com"
+        private const val WEB = "https://www.huya.com"
+
+        /** 与 HuyaApi 一致的移动端 UA：弹幕握手用。 */
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/90.0.4430.91 Mobile Safari/537.36"
         private const val CMD_REGISTER = 16L
         private const val CMD_HEARTBEAT = 20L
         private const val CMD_PUSH = 7L

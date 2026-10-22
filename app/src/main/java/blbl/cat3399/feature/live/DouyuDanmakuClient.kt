@@ -67,8 +67,12 @@ class DouyuDanmakuClient(
         val req =
             Request.Builder()
                 .url(ENDPOINT)
+                // 不能用 apiOkHttp：它的拦截器会注入 B 站 UA/Origin/Referer。
+                .header("User-Agent", USER_AGENT)
+                .header("Origin", WEB)
+                .header("Referer", "$WEB/")
                 .build()
-        ws = BiliClient.apiOkHttp.newWebSocket(req, Listener())
+        ws = BiliClient.liveDanmakuOkHttp.newWebSocket(req, Listener())
     }
 
     override fun close() {
@@ -252,6 +256,12 @@ class DouyuDanmakuClient(
 
     companion object {
         private const val ENDPOINT = "wss://danmuproxy.douyu.com:8506"
+        private const val WEB = "https://www.douyu.com"
+
+        /** 移动端 UA：弹幕握手用（斗鱼网关对非浏览器身份较敏感）。 */
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/90.0.4430.91 Mobile Safari/537.36"
         private const val CLIENT_PACKET_TYPE = 689
 
         /** 构造一个斗鱼报文（小端长度 ×2 + 类型 + 加密 + 保留 + 正文 + \0）。 */
