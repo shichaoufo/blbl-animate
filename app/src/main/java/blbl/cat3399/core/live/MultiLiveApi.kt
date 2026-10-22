@@ -3,6 +3,12 @@ package blbl.cat3399.core.live
 import blbl.cat3399.core.api.BiliApi
 import blbl.cat3399.core.model.LiveAreaParent
 import blbl.cat3399.core.model.LiveRoomCard
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * 多平台直播统一入口：UI 层（直播页 / 播放器）只依赖本对象，按 [LiveSite] 分发到
@@ -63,7 +69,18 @@ internal object MultiLiveApi {
         highBitrateEnabled: Boolean = false,
     ): BiliApi.LivePlayUrl {
         lastPlayUrlCall = LastPlayUrlCall(site, roomId, qualityId, highBitrateEnabled)
-        return when (site) {
+        val result = fetchPlayUrl(site, roomId, qualityId, highBitrateEnabled)
+        schedulePrefetch(site)
+        return result
+    }
+
+    private suspend fun fetchPlayUrl(
+        site: LiveSite,
+        roomId: Long,
+        qualityId: Int,
+        highBitrateEnabled: Boolean,
+    ): BiliApi.LivePlayUrl =
+        when (site) {
             LiveSite.DOUYU -> DouyuApi.playUrl(roomId, qualityId)
             LiveSite.HUYA -> HuyaApi.playUrl(roomId, qualityId)
             LiveSite.BILIBILI ->
@@ -73,7 +90,6 @@ internal object MultiLiveApi {
                     highBitrateEnabled = highBitrateEnabled,
                 )
         }
-    }
 
     // ---------------------------------------------------------------- 直播续流
 
@@ -94,9 +110,62 @@ internal object MultiLiveApi {
     @Volatile
     private var lastPlayUrlCall: LastPlayUrlCall? = null
 
-    /** 重新获取最近一次 [playUrl] 的结果；从未调用过 [playUrl] 时返回 null。 */
+    // ---------------------------------------------------------------- 地址预取
+
+    private val prefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var prefetchJob: Job? = null
+
+    @Volatile
+    private var prefetched: BiliApi.LivePlayUrl? = null
+
+    @Volatile
+    private var prefetchedAtMs = 0L
+
+    /**
+     * 开播后静默预签好下一条地址。
+     *
+     * 虎牙的连接租约约 120 秒，断流时如果现签地址，界面会多等一次接口往返（几百毫秒到
+     * 一秒多，房间详情接口 + 签名）；这段时间主角是黑屏/停顿，很难看。所以在连接建立约
+     * [PREFETCH_DELAY_MS] 后就把下一条签好放着，断流时直接取用，只留连接与解码的时间。
+     *
+     * 只对虎牙做：斗鱼（租约由 URL 的 expire 声明）和 B 站的地址不是按固定时长断连的，
+     * 没必要多打一次接口。
+     */
+    private fun schedulePrefetch(site: LiveSite) {
+        prefetchJob?.cancel()
+        prefetchJob = null
+        prefetched = null
+        if (site != LiveSite.HUYA) return
+        prefetchJob =
+            prefetchScope.launch {
+                delay(PREFETCH_DELAY_MS)
+                val call = lastPlayUrlCall ?: return@launch
+                if (call.site != LiveSite.HUYA) return@launch
+                val fresh =
+                    runCatching {
+                        fetchPlayUrl(call.site, call.roomId, call.qualityId, call.highBitrateEnabled)
+                    }.getOrNull() ?: return@launch
+                prefetched = fresh
+                prefetchedAtMs = System.currentTimeMillis()
+            }
+    }
+
+    /**
+     * 重新获取最近一次 [playUrl] 的结果；从未调用过 [playUrl] 时返回 null。
+     *
+     * 有可用的预取地址时直接返回它（签名窗口 5 分钟，预取 90 秒后仍然有效），否则现签。
+     */
     suspend fun refreshLastPlayUrl(): BiliApi.LivePlayUrl? {
         val call = lastPlayUrlCall ?: return null
+        val cached = prefetched
+        prefetched = null
+        if (cached != null && System.currentTimeMillis() - prefetchedAtMs < PREFETCH_TTL_MS) {
+            // 这一轮用预取，下一轮也要零等待：按新连接重新排一次预取。
+            prefetchJob?.cancel()
+            prefetchJob = null
+            schedulePrefetch(call.site)
+            return cached
+        }
         return playUrl(call.site, call.roomId, call.qualityId, call.highBitrateEnabled)
     }
 
@@ -108,3 +177,9 @@ internal object MultiLiveApi {
             LiveSite.BILIBILI -> 150
         }
 }
+
+/** 开播后多久预签下一条直播地址：虎牙连接租约实测约 120s，留 30s 余量。 */
+private const val PREFETCH_DELAY_MS = 90_000L
+
+/** 预取地址的可用窗口：签名有效期 5 分钟，取 3 分钟，避免用到接近过期的地址。 */
+private const val PREFETCH_TTL_MS = 180_000L
