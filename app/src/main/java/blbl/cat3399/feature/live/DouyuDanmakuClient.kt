@@ -267,8 +267,10 @@ class DouyuDanmakuClient(
         /** 构造一个斗鱼报文（小端长度 ×2 + 类型 + 加密 + 保留 + 正文 + \0）。 */
         fun packet(body: String): ByteArray {
             val text = body.toByteArray(Charsets.UTF_8)
+            // length 字段的值不含「第一个 4 字节长度字段」自身，所以正文偏移是 12，
+            // 缓冲区总长必须是 4 + length（= 12 + 正文 + 1），不能直接用 length。
             val length = 8 + text.size + 1
-            val buf = ByteArray(length)
+            val buf = ByteArray(4 + length)
             fun putInt(offset: Int, v: Int) {
                 buf[offset] = (v and 0xFF).toByte()
                 buf[offset + 1] = ((v shr 8) and 0xFF).toByte()
@@ -282,7 +284,7 @@ class DouyuDanmakuClient(
             buf[10] = 0 // encrypted
             buf[11] = 0 // reserved
             System.arraycopy(text, 0, buf, 12, text.size)
-            buf[length - 1] = 0
+            buf[buf.size - 1] = 0
             return buf
         }
 
