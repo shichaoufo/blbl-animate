@@ -107,7 +107,17 @@ object BiliClient {
                 val original = chain.request()
                 val builder = original.newBuilder()
                 if (original.header("User-Agent").isNullOrBlank()) builder.header("User-Agent", ua)
-                if (original.header("Referer").isNullOrBlank()) builder.header("Referer", "https://www.bilibili.com/")
+                if (original.header("Referer").isNullOrBlank()) {
+                    // 不能给所有媒体请求都塞 B 站 Referer：实测虎牙 FLV CDN 见到
+                    // Referer=https://www.bilibili.com/ 会先正常返回约 300KB，随后
+                    // 直接断开连接（表现为「播几秒就停」且不抛任何错误）。按平台给即可。
+                    val host = original.url.host.lowercase()
+                    when {
+                        isBilibiliHost(host) -> builder.header("Referer", "https://www.bilibili.com/")
+                        host.contains("huya") -> builder.header("Referer", "https://www.huya.com/")
+                        host.contains("douyu") -> builder.header("Referer", "https://www.douyu.com/")
+                    }
+                }
                 // CDN/媒体请求通常不需要 Origin；某些 CDN 反而会因 Origin 触发 403。
                 val req = builder.build()
                 val start = System.nanoTime()
@@ -168,6 +178,14 @@ object BiliClient {
     fun clearLoginSession() {
         accounts.clearAllAccountsAndCurrentSession(appPrefs = prefs, cookies = cookies)
     }
+
+    /** B 站自家的媒体/接口域名：只有这些才该带 B 站 Referer。 */
+    private fun isBilibiliHost(host: String): Boolean =
+        host.endsWith("hdslb.com") ||
+            host.contains("bilivideo") ||
+            host.endsWith("bilibili.com") ||
+            host.endsWith("biliapi.net") ||
+            host.endsWith("biliapi.com")
 
     private fun clientFor(url: String, noCookies: Boolean = false): OkHttpClient {
         val host = runCatching { url.toHttpUrl().host }.getOrNull().orEmpty()
