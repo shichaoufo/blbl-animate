@@ -207,8 +207,13 @@ internal object DouyuApi {
                 headers = apiHeaders(roomId = null, did = deviceId()),
                 noCookies = true,
             )
-        if (json.optInt("error", -1) != 0) {
-            error("$SITE mixList failed: ${json.optInt("error")} ${json.optString("msg")}")
+        // 注意：斗鱼两套列表接口的状态字段不一致——推荐列表（japi/allpage）用 `error`，
+        // 分区列表（gapi/mixList）用 `code`（且没有 error 字段）。只判 error 会让
+        // mixList 永远走失败分支（optInt 取默认 -1），分区房间因此一直加载不出来。
+        val mixCode = json.optInt("code", 0)
+        val apiError = json.optInt("error", 0)
+        if (mixCode != 0 || apiError != 0) {
+            error("$SITE mixList failed: code=$mixCode error=$apiError ${json.optString("msg")}")
         }
         val data = json.optJSONObject("data") ?: return emptyList()
         return withContext(Dispatchers.Default) { parseRoomList(data.optJSONArray("rl")) }
