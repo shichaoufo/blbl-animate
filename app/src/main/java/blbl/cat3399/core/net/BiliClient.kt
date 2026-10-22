@@ -35,6 +35,16 @@ object BiliClient {
     lateinit var apiOkHttp: OkHttpClient
         private set
 
+    /**
+     * 直播弹幕等长连接专用客户端：
+     * - 不挂 [apiOkHttp] 的拦截器（那个拦截器会给所有请求强加 B 站 UA / Origin / Referer，
+     *   虎牙、斗鱼的弹幕网关并不接受这层身份）；
+     * - 读超时为 0，由 WebSocket ping 判活，避免 20s 读超时误杀心跳间隔更长的连接
+     *   （虎牙心跳 60s、斗鱼 45s）。
+     */
+    lateinit var liveDanmakuOkHttp: OkHttpClient
+        private set
+
     private lateinit var apiOkHttpNoCookies: OkHttpClient
 
     lateinit var cdnOkHttp: OkHttpClient
@@ -138,6 +148,14 @@ object BiliClient {
                 }
                 res
             }
+            .build()
+
+        // 弹幕 WebSocket 专用：基于未加拦截器的 baseClient，避免 B 站身份注入；
+        // 读超时设为 0（交给 pingInterval 判活），ping 20s 一次保活。
+        liveDanmakuOkHttp = baseClient.newBuilder()
+            .cookieJar(CookieJar.NO_COOKIES)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
             .build()
 
         AppLog.i(TAG, "init ua=${prefs.userAgent.take(48)} cookiesSess=${cookies.hasSessData()}")
