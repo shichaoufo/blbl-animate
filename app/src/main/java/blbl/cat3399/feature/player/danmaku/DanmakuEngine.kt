@@ -99,7 +99,8 @@ internal class DanmakuEngine(
         DanmakuConfig(
             enabled = true,
             opacity = 1f,
-            textSizeSp = 18f,
+            // 与 AppPrefs.DANMAKU_TEXT_SIZE_SP_DEFAULT 一致；真正的值由 setConfig 覆盖。
+            textSizeSp = 36f,
             fontWeight = DanmakuFontWeight.Bold,
             strokeWidthPx = 4,
             speedLevel = 4,
@@ -108,7 +109,7 @@ internal class DanmakuEngine(
             showHighLikeIcon = true,
         )
 
-    @Volatile private var textSizePx: Float = sp(18f)
+    @Volatile private var textSizePx: Float = sp(36f)
     @Volatile private var strokeWidthPx: Float = 4f
     @Volatile private var outlinePadPx: Float = 2f
 
