@@ -271,19 +271,17 @@ internal object HuyaApi {
         val seen = HashSet<String>()
         val flv = stream.optJSONObject("flv")?.optJSONArray("multiLine") ?: JSONArray()
         val hls = stream.optJSONObject("hls")?.optJSONArray("multiLine") ?: JSONArray()
-        // FLV(native 凭据) 优先，HLS 仅兜底。依据（2026-10-23 实测）：
-        // 1) web 签名（huya_webh5）的 FLV 长连接 120.7s 被 CDN 主动 EOF；同一时刻 native 凭据
-        //    （ctype=huya_pc_exe）的连接连跑 300s 仍未断 —— 租约只掐 web 签名。
-        // 2) HLS 虽然不受租约影响，但同一份签名地址有「请求预算」：约 100 次后整条链路 403，
-        //    且换签（新 seqid/wsTime）也救不回来，只能等冷却。ExoPlayer 每 3 秒取一次 playlist、
-        //    每个分片再各来一次，两分钟就打光预算 → autoFailover 连环换线（ci.34/ci.39 真机日志）。
-        // 3) native 凭据的 FLV 只有一条长连接，请求量最低，也不触发换签（needsLeaseSwitch 排除
-        //    ctype=huya_pc_exe），因此不再有「100 秒主动换源」的跳变。
-        for ((arr, isHls) in listOf(flv to false, hls to true)) {
+        // HLS 优先，FLV（web 签名）兜底。依据（2026-10-23 多轮真机对照）：
+        // 1) ci.37（HLS 优先 + 每 45s 就地续签）真机连续 5 分 38 秒零故障、零换线，是至今
+        //    最好的一轮；ci.39 那次 137 秒后 403 已确认是本地压测同时打同一公网 IP 造成的。
+        // 2) FLV(native 凭据，ctype=huya_pc_exe) 在 PC 上稳定，但真机上第一条就 403、
+        //    第二条 1.7 秒 EOF，触发 LiveReconnect 每 1.5 秒重连一次的抖动循环（ci.40 日志），
+        //    所以不能放主路径。FLV 只保留 web 签名窗口期兜底（约 120 秒，由引擎主动换签）。
+        for ((arr, isHls) in listOf(hls to true, flv to false)) {
             var added = 0
             for (i in 0 until arr.length()) {
                 if (lines.size >= 6) break
-                if (added >= (if (isHls) 3 else 2)) break
+                if (added >= (if (isHls) 4 else 2)) break
                 val entry = arr.optJSONObject(i) ?: continue
                 val cdn = entry.optString("cdnType").trim()
                 if (cdn.isBlank()) continue
@@ -292,9 +290,7 @@ internal object HuyaApi {
                 val antiCode = base.optString(if (isHls) "sHlsAntiCode" else "sFlvAntiCode")
                 val streamName = base.optString("sStreamName").trim()
                 if (baseUrl.isBlank() || streamName.isBlank()) continue
-                // FLV 线路优先用 native 凭据：web antiCode 签出的地址在连接建立约 120 秒后
-                // 被 CDN 主动断开（实测 120.7s，正常 EOF、不报错），native 凭据的连接连跑 300s
-                // 仍未断；同一个 token 在 AL/TX/HS 三条 CDN 上都返回 200。
+                // HLS 用 antiCode 现签；FLV 兜底同样用 web antiCode（native 凭据在真机 403，见上）。
                 val url =
                     (
                         if (isHls) {
@@ -303,10 +299,10 @@ internal object HuyaApi {
                             HuyaWupToken.probeOnce(streamName)
                             runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, true) }.getOrNull()
                         } else {
-                            // FLV 线路一律优先用 native 凭据（同一条流共用一个 token，取一次即缓存）。
-                            // 万一 native 取不到，再退回 web 签名——那种地址会 120 秒断流，
-                            // 由引擎的「主动换签」兜住。
-                            val native = nativeFlvUrl(baseUrl, streamName, bitRate)
+                            // FLV 兜底一律用 web antiCode 签名。native 凭据（ctype=huya_pc_exe）在 PC
+                            // 上能连 300 秒，但真机上第一批请求就 403、随后 1.7 秒 EOF（ci.40 日志），
+                            // 所以默认关闭；留开关方便以后 A/B。
+                            val native = if (nativeFlvEnabled) nativeFlvUrl(baseUrl, streamName, bitRate) else null
                             native
                                 ?: runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, false) }.getOrNull()
                         }
@@ -314,6 +310,12 @@ internal object HuyaApi {
                 if (seen.add(url)) {
                     lines.add(BiliApi.LivePlayLine(order = lines.size + 1, url = url))
                     added++
+                    // 诊断：线路构成落到日志里，方便和 PC 复刻逐字段比对（wsSecret 只留前 8 位）。
+                    val kind = if (isHls) "hls" else "flv"
+                    val host = url.substringAfter("://").substringBefore('/')
+                    val secret = url.substringAfter("wsSecret=", "").take(8)
+                    val ctype = url.substringAfter("ctype=", "").substringBefore('&')
+                    AppLog.i("HuyaApi", "line ${lines.size} $kind cdn=$cdn host=$host wsSecret=$secret ctype=$ctype")
                 }
             }
         }
@@ -328,6 +330,9 @@ internal object HuyaApi {
     }
 
     // ---------------------------------------------------------------- native 凭据
+
+    /** 是否用 native 凭据拼 FLV 地址。真机实测 403（ci.40），默认关闭。 */
+    private val nativeFlvEnabled: Boolean = false
 
     /** native 凭据缓存：同一条流只取一次。失败不缓存，下次调用会重试。 */
     @Volatile
