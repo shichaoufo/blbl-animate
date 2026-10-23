@@ -271,16 +271,19 @@ internal object HuyaApi {
         val seen = HashSet<String>()
         val flv = stream.optJSONObject("flv")?.optJSONArray("multiLine") ?: JSONArray()
         val hls = stream.optJSONObject("hls")?.optJSONArray("multiLine") ?: JSONArray()
-        // HLS 优先。虎牙的「短传输租约」只掐长连接：FLV 单连接约 120 秒被 CDN 主动断开，
-        // 而 HLS 是「取一次 playlist、再按分片各开一条短连接」，租约掐不到——实测同一份签名
-        // 地址连续轮询 233 秒仍然 200 且分片序号持续推进。所以默认走 HLS 就不会断流，
-        // 也就不需要换源，观感上没有黑屏也没有跳画面。
-        // FLV 保留 2 条兜底（HLS 全部取不到时仍可播），它那条会退回到「主动换签」逻辑。
-        for ((arr, isHls) in listOf(hls to true, flv to false)) {
+        // FLV(native 凭据) 优先，HLS 仅兜底。依据（2026-10-23 实测）：
+        // 1) web 签名（huya_webh5）的 FLV 长连接 120.7s 被 CDN 主动 EOF；同一时刻 native 凭据
+        //    （ctype=huya_pc_exe）的连接连跑 300s 仍未断 —— 租约只掐 web 签名。
+        // 2) HLS 虽然不受租约影响，但同一份签名地址有「请求预算」：约 100 次后整条链路 403，
+        //    且换签（新 seqid/wsTime）也救不回来，只能等冷却。ExoPlayer 每 3 秒取一次 playlist、
+        //    每个分片再各来一次，两分钟就打光预算 → autoFailover 连环换线（ci.34/ci.39 真机日志）。
+        // 3) native 凭据的 FLV 只有一条长连接，请求量最低，也不触发换签（needsLeaseSwitch 排除
+        //    ctype=huya_pc_exe），因此不再有「100 秒主动换源」的跳变。
+        for ((arr, isHls) in listOf(flv to false, hls to true)) {
             var added = 0
             for (i in 0 until arr.length()) {
                 if (lines.size >= 6) break
-                if (added >= (if (isHls) 4 else 2)) break
+                if (added >= (if (isHls) 3 else 2)) break
                 val entry = arr.optJSONObject(i) ?: continue
                 val cdn = entry.optString("cdnType").trim()
                 if (cdn.isBlank()) continue
@@ -289,9 +292,9 @@ internal object HuyaApi {
                 val antiCode = base.optString(if (isHls) "sHlsAntiCode" else "sFlvAntiCode")
                 val streamName = base.optString("sStreamName").trim()
                 if (baseUrl.isBlank() || streamName.isBlank()) continue
-                // FLV 兜底线路优先用 native 凭据：web antiCode 签出的地址在连接建立约 120 秒后
-                // 被 CDN 主动断开（实测 120.8s，正常 EOF、不报错），native 凭据只约束新建连接，
-                // 不会掐断已建立的连接（实测 210s 无 EOF）。走 HLS 时用不到它。
+                // FLV 线路优先用 native 凭据：web antiCode 签出的地址在连接建立约 120 秒后
+                // 被 CDN 主动断开（实测 120.7s，正常 EOF、不报错），native 凭据的连接连跑 300s
+                // 仍未断；同一个 token 在 AL/TX/HS 三条 CDN 上都返回 200。
                 val url =
                     (
                         if (isHls) {
@@ -300,9 +303,10 @@ internal object HuyaApi {
                             HuyaWupToken.probeOnce(streamName)
                             runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, true) }.getOrNull()
                         } else {
-                            // 只给第一条线路用 native：既拿到「不会被掐断」的那条，又保留其余
-                            // 线路的 web 签名，万一 native 凭据被服务端作废，自动换线仍能播。
-                            val native = if (lines.isEmpty()) nativeFlvUrl(baseUrl, streamName, bitRate) else null
+                            // FLV 线路一律优先用 native 凭据（同一条流共用一个 token，取一次即缓存）。
+                            // 万一 native 取不到，再退回 web 签名——那种地址会 120 秒断流，
+                            // 由引擎的「主动换签」兜住。
+                            val native = nativeFlvUrl(baseUrl, streamName, bitRate)
                             native
                                 ?: runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, false) }.getOrNull()
                         }
