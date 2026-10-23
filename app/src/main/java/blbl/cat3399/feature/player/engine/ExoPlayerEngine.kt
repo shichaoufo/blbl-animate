@@ -18,6 +18,7 @@ import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -127,6 +128,30 @@ internal class ExoPlayerEngine(
 
     /** 断流前主动换签的任务（短租约地址专用）。 */
     private var liveSwitchJob: Job? = null
+
+    /**
+     * HLS 就地续签状态。
+     *
+     * 虎牙 HLS 的 playlist 是每 4 秒重取一次的长跑请求，而同一份签名实测约 125 秒后开始回
+     * 403（ci.34 真机两条线路都是 131~132 秒，PC 端 1s 轮询 125 秒）。旧做法靠 autoFailover
+     * 换线下台阶，代价是位置重置到直播边缘、画面明显跳一下，还弹「线路 x 失败」。
+     * 这里改为：后台每 [HLS_RENEW_INTERVAL_MS] 现签一条同线路地址，数据源层把 playlist 的
+     * URI 换掉——分片地址由新 playlist 自带新签名，播放不中断、不跳。
+     */
+    private var hlsRenewJob: Job? = null
+
+    @Volatile
+    private var hlsRenewUrl: String = ""
+
+    @Volatile
+    private var hlsRenewedAtMs: Long = 0L
+
+    @Volatile
+    private var hlsPlaylistPath: String = ""
+
+    /** 已经替换进 playlist 请求的那份地址，用来把「换签」日志压到每 [HLS_RENEW_INTERVAL_MS] 一条。 */
+    @Volatile
+    private var hlsRenewApplied: Uri? = null
 
     private var seamlessQualitySource: Boolean = false
     private var seamlessAvailableQns: Set<Int> = emptySet()
@@ -348,6 +373,7 @@ internal class ExoPlayerEngine(
         qualitySwitchStartedAtMs = 0L
         qualitySwitchStartedPositionMs = 0L
         qualitySwitchFormatChangedAtMs = 0L
+        cancelHlsRenew()
         when (source) {
             is PlaybackSource.Vod -> {
                 val dash = source.playable as? Playable.Dash
@@ -391,8 +417,16 @@ internal class ExoPlayerEngine(
 
                 val isM3u8 = url.substringBefore('?').trim().lowercase(Locale.US).endsWith(".m3u8")
                 if (isM3u8) {
+                    val playlistPath = url.substringBefore('?')
+                    val hlsFactory =
+                        if (isHuyaHls(url)) {
+                            startHlsRenew(playlistPath)
+                            renewingFactory(factory, playlistPath)
+                        } else {
+                            factory
+                        }
                     val hlsSource =
-                        HlsMediaSource.Factory(factory)
+                        HlsMediaSource.Factory(hlsFactory)
                             .setPlaylistParserFactory(liveHlsPlaylistParserFactory)
                             .createMediaSource(MediaItem.fromUri(uri))
                     exoPlayer.setMediaSource(hlsSource)
@@ -538,6 +572,89 @@ internal class ExoPlayerEngine(
         val path = uri.path?.lowercase(Locale.US).orEmpty()
         if (!path.endsWith(".flv")) return false
         return uri.getQueryParameter("ctype") != "huya_pc_exe"
+    }
+
+    private fun isHuyaHls(url: String): Boolean {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val host = uri.host?.lowercase(Locale.US).orEmpty()
+        if (!host.contains("huya")) return false
+        val path = uri.path?.lowercase(Locale.US).orEmpty()
+        return path.endsWith(".m3u8")
+    }
+
+    /**
+     * 只在「重取 playlist（同一个 .m3u8）」时把 URI 换成刚签好的地址。
+     *
+     * 分片请求（.ts）一律放行原地址——新 playlist 里的分片本来就带着新签名，
+     * 替换它们反而会把不同批次的签名混在一起。
+     */
+    private fun renewingFactory(factory: DataSource.Factory, playlistPath: String): DataSource.Factory =
+        ResolvingDataSource.Factory(factory) { dataSpec ->
+            val renewed = renewedPlaylistUri(dataSpec.uri)
+            if (renewed == null) {
+                dataSpec
+            } else {
+                if (renewed != hlsRenewApplied) {
+                    hlsRenewApplied = renewed
+                    AppLog.i("LivePlayer", "hls playlist re-signed seqid=${renewed.toString().substringAfter("seqid=", "").substringBefore('&').take(17)}")
+                }
+                dataSpec.withUri(renewed)
+            }
+        }
+
+    private fun renewedPlaylistUri(uri: Uri): Uri? {
+        val path = hlsPlaylistPath
+        if (path.isBlank()) return null
+        if (uri.toString().substringBefore('?') != path) return null
+        val renewed = hlsRenewUrl
+        if (renewed.isBlank()) return null
+        if (SystemClock.elapsedRealtime() - hlsRenewedAtMs > HLS_RENEW_MAX_AGE_MS) return null
+        return runCatching { Uri.parse(renewed) }.getOrNull()
+    }
+
+    /**
+     * 每 [HLS_RENEW_INTERVAL_MS] 现签一次同一条线路的地址放进 [hlsRenewUrl]。
+     *
+     * 只认「同一 CDN 同一条流」的地址（URL path 完全一致）：换了 CDN 主机的话，
+     * playlist 里的相对分片地址会被解析到另一台机器上，取不到分片。
+     */
+    private fun startHlsRenew(playlistPath: String) {
+        cancelHlsRenew()
+        hlsPlaylistPath = playlistPath
+        hlsRenewJob =
+            scope.launch {
+                delay(HLS_RENEW_INTERVAL_MS)
+                var misses = 0
+                while (true) {
+                    if (currentSource !is PlaybackSource.Live) return@launch
+                    val fresh = MultiLiveApi.renewLastPlayUrl()
+                    val same =
+                        fresh
+                            ?.lines
+                            ?.firstOrNull { it.url.substringBefore('?') == playlistPath }
+                            ?.url
+                    if (same.isNullOrBlank()) {
+                        misses += 1
+                        AppLog.w("LivePlayer", "hls renew miss #$misses path=${playlistPath.takeLast(26)}")
+                        if (misses >= HLS_RENEW_MAX_MISSES) return@launch
+                    } else {
+                        misses = 0
+                        hlsRenewUrl = same
+                        hlsRenewedAtMs = SystemClock.elapsedRealtime()
+                        AppLog.i("LivePlayer", "hls renew ok seqid=${same.substringAfter("seqid=", "").substringBefore('&').take(17)}")
+                    }
+                    delay(HLS_RENEW_INTERVAL_MS)
+                }
+            }
+    }
+
+    private fun cancelHlsRenew() {
+        hlsRenewJob?.cancel()
+        hlsRenewJob = null
+        hlsRenewUrl = ""
+        hlsRenewedAtMs = 0L
+        hlsPlaylistPath = ""
+        hlsRenewApplied = null
     }
 
     override fun addListener(listener: BlblPlayerEngine.Listener) {
@@ -1032,6 +1149,15 @@ private const val LIVE_RECONNECT_MAX = 8
 
 /** 短租约直播在连接建立多久后主动换签：虎牙实测约 120s 断流，留 20s 余量。 */
 private const val LIVE_LEASE_SWITCH_MS = 100_000L
+
+/** HLS playlist 的续签间隔：虎牙同一份签名实测约 125s 后开始 403，取一半留余量。 */
+private const val HLS_RENEW_INTERVAL_MS = 45_000L
+
+/** 续签地址的可用窗口：超过就不再用它，宁可让原地址先去试。 */
+private const val HLS_RENEW_MAX_AGE_MS = 150_000L
+
+/** 连续多次拿不到同线路新地址（房间下播 / 接口异常）就停下，避免无意义地轮询。 */
+private const val HLS_RENEW_MAX_MISSES = 4
 
 private class BlblRenderersFactory(
     context: Context,
