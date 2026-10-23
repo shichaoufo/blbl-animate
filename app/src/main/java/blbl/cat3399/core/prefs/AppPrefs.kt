@@ -222,8 +222,14 @@ class AppPrefs(context: Context) {
         get() = prefs.getFloat(KEY_DANMAKU_OPACITY, 1.0f)
         set(value) = prefs.edit().putFloat(KEY_DANMAKU_OPACITY, value).apply()
 
+    /**
+     * 弹幕字号（sp）。默认 36。
+     *
+     * 注意：这是**全局**弹幕字号，B 站点播与直播（虎牙/斗鱼/抖音等）共用同一个 DanmakuView，
+     * 所以改这里等于所有场景一起改。
+     */
     var danmakuTextSizeSp: Float
-        get() = prefs.getFloat(KEY_DANMAKU_TEXT_SIZE_SP, 18f)
+        get() = prefs.getFloat(KEY_DANMAKU_TEXT_SIZE_SP, DANMAKU_TEXT_SIZE_SP_DEFAULT)
         set(value) = prefs.edit().putFloat(KEY_DANMAKU_TEXT_SIZE_SP, value).apply()
 
     var danmakuLaneDensity: String
@@ -322,8 +328,14 @@ class AppPrefs(context: Context) {
         }
         set(value) = prefs.edit().putInt(KEY_PLAYER_PREFERRED_QN_PORTRAIT, value).apply()
 
+    /**
+     * 首选视频编码。默认 **HEVC**（2026-10 由 AVC 改过来）。
+     *
+     * 只作用于 B 站视频（[blbl.cat3399.feature.player.PlayerActivity] 构造 session 时读取，
+     * 用于请求 fnval 与选流）；直播不看这个值，各直播平台自己决定编码。
+     */
     var playerPreferredCodec: String
-        get() = prefs.getString(KEY_PLAYER_CODEC, "AVC") ?: "AVC"
+        get() = prefs.getString(KEY_PLAYER_CODEC, PLAYER_CODEC_HEVC) ?: PLAYER_CODEC_HEVC
         set(value) = prefs.edit().putString(KEY_PLAYER_CODEC, value).apply()
 
     var playerSeamlessQualitySwitchEnabled: Boolean
@@ -497,7 +509,9 @@ class AppPrefs(context: Context) {
 
     var playerHoldSeekMode: String
         get() {
-            val raw = prefs.getString(KEY_PLAYER_HOLD_SEEK_MODE, PLAYER_HOLD_SEEK_MODE_SPEED) ?: PLAYER_HOLD_SEEK_MODE_SPEED
+            val raw =
+                prefs.getString(KEY_PLAYER_HOLD_SEEK_MODE, PLAYER_HOLD_SEEK_MODE_DEFAULT)
+                    ?: PLAYER_HOLD_SEEK_MODE_DEFAULT
             val v = raw.trim()
             return when (v) {
                 PLAYER_HOLD_SEEK_MODE_SPEED,
@@ -505,7 +519,7 @@ class AppPrefs(context: Context) {
                 PLAYER_HOLD_SEEK_MODE_SCRUB_FIXED_TIME,
                 -> v
 
-                else -> PLAYER_HOLD_SEEK_MODE_SPEED
+                else -> PLAYER_HOLD_SEEK_MODE_DEFAULT
             }
         }
         set(value) {
@@ -516,7 +530,7 @@ class AppPrefs(context: Context) {
                     PLAYER_HOLD_SEEK_MODE_SCRUB_FIXED_TIME,
                     -> value
 
-                    else -> PLAYER_HOLD_SEEK_MODE_SPEED
+                    else -> PLAYER_HOLD_SEEK_MODE_DEFAULT
                 }
             prefs.edit().putString(KEY_PLAYER_HOLD_SEEK_MODE, v).apply()
         }
@@ -549,8 +563,9 @@ class AppPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_PLAYER_AUTO_RESUME_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_PLAYER_AUTO_RESUME_ENABLED, value).apply()
 
+    /** 自动跳过片段（空降助手）。默认开；只有 B 站视频有片段数据，直播不适用。 */
     var playerAutoSkipSegmentsEnabled: Boolean
-        get() = prefs.getBoolean(KEY_PLAYER_AUTO_SKIP_SEGMENTS_ENABLED, false)
+        get() = prefs.getBoolean(KEY_PLAYER_AUTO_SKIP_SEGMENTS_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_PLAYER_AUTO_SKIP_SEGMENTS_ENABLED, value).apply()
 
     var playerAutoSkipSegmentCategories: List<String>
@@ -735,8 +750,9 @@ class AppPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_PLAYER_TOGGLE_PLAY_STATE_SHOW_OSD, true)
         set(value) = prefs.edit().putBoolean(KEY_PLAYER_TOGGLE_PLAY_STATE_SHOW_OSD, value).apply()
 
+    /** 底部常驻进度条。默认开；直播没有可拖动进度条，只在 B 站点播生效。 */
     var playerPersistentBottomProgressEnabled: Boolean
-        get() = prefs.getBoolean(KEY_PLAYER_PERSISTENT_BOTTOM_PROGRESS, false)
+        get() = prefs.getBoolean(KEY_PLAYER_PERSISTENT_BOTTOM_PROGRESS, true)
         set(value) = prefs.edit().putBoolean(KEY_PLAYER_PERSISTENT_BOTTOM_PROGRESS, value).apply()
 
     var playerPersistentClockEnabled: Boolean
@@ -824,12 +840,15 @@ class AppPrefs(context: Context) {
             if (!prefs.contains(KEY_PLAYER_OSD_BUTTONS)) return DEFAULT_PLAYER_OSD_BUTTONS
             val stored = loadStringList(KEY_PLAYER_OSD_BUTTONS)
             val normalized = normalizePlayerOsdButtons(stored)
-            return migratePlayerOsdDetailButtonIfNeeded(normalized)
+            return migratePlayerOsdSocialButtonsIfNeeded(migratePlayerOsdDetailButtonIfNeeded(normalized))
         }
         set(value) {
             saveStringList(KEY_PLAYER_OSD_BUTTONS, normalizePlayerOsdButtons(value))
             // Once user manually configures OSD buttons, never force-enable new buttons again.
-            prefs.edit().putBoolean(KEY_PLAYER_OSD_BUTTONS_DETAIL_MIGRATED, true).apply()
+            prefs.edit()
+                .putBoolean(KEY_PLAYER_OSD_BUTTONS_DETAIL_MIGRATED, true)
+                .putBoolean(KEY_PLAYER_OSD_BUTTONS_SOCIAL_MIGRATED, true)
+                .apply()
         }
 
     internal var playerCustomShortcuts: List<PlayerCustomShortcut>
@@ -982,6 +1001,25 @@ class AppPrefs(context: Context) {
         if (normalized.contains(PLAYER_OSD_BTN_DETAIL)) return normalized
 
         val migrated = normalized + PLAYER_OSD_BTN_DETAIL
+        saveStringList(KEY_PLAYER_OSD_BUTTONS, migrated)
+        return migrated
+    }
+
+    /**
+     * 一次性把点赞/投币/收藏补进用户已有的 OSD 配置。
+     *
+     * 新版把这几个按钮改成默认勾选；但老用户的集合已经写进 SharedPreferences 了，
+     * 只改 [DEFAULT_PLAYER_OSD_BUTTONS] 对他们不生效。这里补一次，之后由用户自己决定。
+     */
+    private fun migratePlayerOsdSocialButtonsIfNeeded(normalized: List<String>): List<String> {
+        if (prefs.getBoolean(KEY_PLAYER_OSD_BUTTONS_SOCIAL_MIGRATED, false)) return normalized
+        prefs.edit().putBoolean(KEY_PLAYER_OSD_BUTTONS_SOCIAL_MIGRATED, true).apply()
+        val missing =
+            listOf(PLAYER_OSD_BTN_LIKE, PLAYER_OSD_BTN_COIN, PLAYER_OSD_BTN_FAV)
+                .filterNot { normalized.contains(it) }
+        if (missing.isEmpty()) return normalized
+
+        val migrated = normalized + missing
         saveStringList(KEY_PLAYER_OSD_BUTTONS, migrated)
         return migrated
     }
@@ -1143,6 +1181,7 @@ class AppPrefs(context: Context) {
         private const val KEY_PLAYER_UP_QUICK_CARD_ENABLED = "player_up_quick_card_enabled"
         private const val KEY_PLAYER_OSD_BUTTONS = "player_osd_buttons"
         private const val KEY_PLAYER_OSD_BUTTONS_DETAIL_MIGRATED = "player_osd_buttons_detail_migrated"
+        private const val KEY_PLAYER_OSD_BUTTONS_SOCIAL_MIGRATED = "player_osd_buttons_social_migrated"
         private const val KEY_PLAYER_CUSTOM_SHORTCUTS = "player_custom_shortcuts"
         private const val KEY_GRID_SPAN = "grid_span"
         private const val KEY_DYNAMIC_GRID_SPAN = "dynamic_grid_span"
@@ -1188,6 +1227,9 @@ class AppPrefs(context: Context) {
         const val DANMAKU_AREA_COMPAT_EPSILON = 0.0001f
 
         val DANMAKU_AREA_OPTIONS: List<Float> = (1..10).map { it / 10f }
+
+        /** 弹幕字号默认值（sp）。2026-10 由 18 改为 36，点播与直播共用。 */
+        const val DANMAKU_TEXT_SIZE_SP_DEFAULT = 36f
 
         private val LEGACY_DANMAKU_AREA_OPTIONS: List<Float> =
             listOf(
@@ -1271,6 +1313,14 @@ class AppPrefs(context: Context) {
         const val PLAYER_HOLD_SEEK_MODE_SPEED = "speed"
         const val PLAYER_HOLD_SEEK_MODE_SCRUB = "scrub"
         const val PLAYER_HOLD_SEEK_MODE_SCRUB_FIXED_TIME = "scrub_fixed_time"
+
+        /** 长按快进默认「拖动进度条」（2026-10 由倍率加速改过来）。 */
+        const val PLAYER_HOLD_SEEK_MODE_DEFAULT = PLAYER_HOLD_SEEK_MODE_SCRUB
+
+        /** 视频编码取值，与播放器设置里的 AVC/HEVC/AV1 选项一致。 */
+        const val PLAYER_CODEC_AVC = "AVC"
+        const val PLAYER_CODEC_HEVC = "HEVC"
+        const val PLAYER_CODEC_AV1 = "AV1"
         const val PLAYER_HOLD_SEEK_SPEED_DEFAULT = 3.0f
         val PLAYER_HOLD_SCRUB_SECONDS_OPTIONS: Set<Int> = linkedSetOf(5, 8, 10, 12, 15, 17, 20, 22, 25, 27, 30)
         const val PLAYER_HOLD_SCRUB_SECONDS_DEFAULT = 10
@@ -1310,8 +1360,12 @@ class AppPrefs(context: Context) {
                 PLAYER_OSD_BTN_DANMAKU,
                 PLAYER_OSD_BTN_COMMENTS,
                 PLAYER_OSD_BTN_DETAIL,
-                PLAYER_OSD_BTN_SPONSOR_SUBMIT,
                 PLAYER_OSD_BTN_UP,
+                // 2026-10 默认勾选点赞/投币/收藏（顺序与 OSD 设置弹窗的展示顺序一致）。
+                PLAYER_OSD_BTN_LIKE,
+                PLAYER_OSD_BTN_COIN,
+                PLAYER_OSD_BTN_FAV,
+                PLAYER_OSD_BTN_SPONSOR_SUBMIT,
                 PLAYER_OSD_BTN_LIST_PANEL,
                 PLAYER_OSD_BTN_ADVANCED,
                 PLAYER_OSD_BTN_CLOSE_PLAYER,
