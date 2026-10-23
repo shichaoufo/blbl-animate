@@ -4,6 +4,7 @@ import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionSpec
 import okhttp3.CookieJar
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -11,6 +12,7 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.TlsVersion
 import java.io.ByteArrayOutputStream
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
@@ -36,6 +38,9 @@ import java.util.concurrent.TimeUnit
 internal object HuyaWupToken {
     private const val WUP_URL = "https://wup.huya.com/"
 
+    /** 明文兜底：仅当 HTTPS 各档都失败时才用（实测同一份报文明文同样 200）。 */
+    private const val WUP_URL_PLAIN = "http://wup.huya.com/"
+
     /** 虎牙 native 凭据的 appId（PureLive `tokenAppId`）。 */
     private const val APP_ID = 66
 
@@ -52,13 +57,24 @@ internal object HuyaWupToken {
     private val CONTENT_TYPE = "application/x-wup".toMediaType()
 
     /**
-     * 两个 client：先按默认协议（会协商 HTTP/2），失败再强制 HTTP/1.1。
+     * 传输层阶梯：设备上恒定 502，而同网络下用同一份报文从 PC 打
+     * TLS1.3 / TLS1.2 / keep-alive / 明文 http 四种组合全是 200（`server: HUYA/2.15.3`），
+     * 说明报文不是问题、差异在设备侧的传输层。于是按「最可能通」到「最不可能但能绕过
+     * TLS 中间层」的顺序逐档尝试，成败都记进日志：
      *
-     * 2026-10-23 真机日志里 wup 稳定返回 502，而同网络下用 curl / Python / Node(h2) 打同一
-     * 接口都是 200（4 个节点全部 200），说明差异在设备侧链路而不是报文。这里做三件事：
-     * 强制直连、协议降级重试、失败时把 502 的响应头与响应体记进日志。
+     * 1. `h2`      —— 默认（会协商 HTTP/2）
+     * 2. `h1.1`    —— 强制 HTTP/1.1，排除网关对 h2 的处理差异
+     * 3. `h1.1-tls12` —— 再锁到 TLS1.2，排除设备 TLS1.3 栈的差异
+     * 4. `http`    —— 明文。设备上若有 TLS 中间层（安全软件/模拟器网络层）在 502，
+     *                这一档能整体绕开；虎牙的媒体地址本身也是明文 http。
      */
-    private val clients: List<Pair<String, OkHttpClient>> by lazy {
+    private class Attempt(
+        val label: String,
+        val url: String,
+        val client: OkHttpClient,
+    )
+
+    private val attempts: List<Attempt> by lazy {
         val base =
             BiliClient.apiOkHttp
                 .newBuilder()
@@ -68,9 +84,23 @@ internal object HuyaWupToken {
                 .proxy(Proxy.NO_PROXY)
                 .readTimeout(8, TimeUnit.SECONDS)
                 .writeTimeout(8, TimeUnit.SECONDS)
+        val tls12 =
+            ConnectionSpec
+                .Builder(ConnectionSpec.MODERN_TLS)
+                .tlsVersions(TlsVersion.TLS_1_2)
+                .build()
         listOf(
-            "h2" to base.build(),
-            "h1.1" to base.protocols(listOf(Protocol.HTTP_1_1)).build(),
+            Attempt("h2", WUP_URL, base.build()),
+            Attempt("h1.1", WUP_URL, base.protocols(listOf(Protocol.HTTP_1_1)).build()),
+            Attempt(
+                "h1.1-tls12",
+                WUP_URL,
+                base
+                    .protocols(listOf(Protocol.HTTP_1_1))
+                    .connectionSpecs(listOf(tls12))
+                    .build(),
+            ),
+            Attempt("http", WUP_URL_PLAIN, base.protocols(listOf(Protocol.HTTP_1_1)).build()),
         )
     }
 
@@ -87,31 +117,36 @@ internal object HuyaWupToken {
             if (name.isEmpty()) return@withContext null
             if (System.currentTimeMillis() < blockedUntilMs) return@withContext null
             val body = runCatching { encodeRequest(name) }.getOrNull() ?: return@withContext null
-            val request = buildRequest(body)
             var reason = ""
-            for ((label, client) in clients) {
+            for (attempt in attempts) {
+                val request = buildRequest(body, attempt.url)
                 val token =
                     runCatching {
-                        client.newCall(request).execute().use { response ->
+                        attempt.client.newCall(request).execute().use { response ->
                             if (!response.isSuccessful) {
-                                reason = "$label ${describe(response)}"
+                                reason = "${attempt.label} ${describe(response)}"
+                                AppLog.w("HuyaToken", "wup ${attempt.label} -> ${describe(response)}")
                                 return@use null
                             }
                             val bytes = response.body?.bytes()
                             if (bytes == null || bytes.isEmpty()) {
-                                reason = "$label empty body"
+                                reason = "${attempt.label} empty body"
                                 return@use null
                             }
                             parseToken(bytes).also { parsed ->
-                                if (parsed == null) reason = "$label token unparsable"
+                                if (parsed == null) reason = "${attempt.label} token unparsable"
                             }
                         }
                     }.onFailure {
-                        reason = "$label ${it::class.java.simpleName}: ${it.message}"
+                        reason = "${attempt.label} ${it::class.java.simpleName}: ${it.message}"
                     }.getOrNull()
                 if (token != null) {
                     failures = 0
                     blockedUntilMs = 0L
+                    AppLog.i(
+                        "HuyaToken",
+                        "native token ok via ${attempt.label} (${attempt.url.substringBefore("//")})",
+                    )
                     return@withContext token
                 }
             }
@@ -121,9 +156,12 @@ internal object HuyaWupToken {
             null
         }
 
-    private fun buildRequest(body: ByteArray): Request =
+    private fun buildRequest(
+        body: ByteArray,
+        url: String,
+    ): Request =
         Request.Builder()
-            .url(WUP_URL)
+            .url(url)
             .header("content-type", "application/x-wup")
             .header("origin", "https://www.huya.com")
             .header("referer", "https://www.huya.com/")
@@ -131,11 +169,12 @@ internal object HuyaWupToken {
             .post(body.toRequestBody(CONTENT_TYPE))
             .build()
 
-    /** 失败时的诊断串：状态码 + 网关标识 + 响应体可打印前缀（502 时能看出是谁挡的）。 */
+    /** 失败时的诊断串：状态码 + 协议/TLS + 网关标识 + 响应体可打印前缀。 */
     private fun describe(response: Response): String {
         val server = response.header("server").orEmpty()
         val via = response.header("via").orEmpty()
         val cache = response.header("x-cache").orEmpty()
+        val tls = response.handshake?.tlsVersion?.javaName ?: "-"
         val snippet =
             runCatching {
                 val bytes = response.body?.bytes() ?: return@runCatching ""
@@ -144,7 +183,8 @@ internal object HuyaWupToken {
                     .take(100)
                     .trim()
             }.getOrDefault("")
-        return "http=${response.code} server=$server via=$via cache=$cache body=$snippet"
+        return "http=${response.code} proto=${response.protocol} tls=$tls " +
+            "server=$server via=$via cache=$cache body=$snippet"
     }
 
     /**
