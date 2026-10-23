@@ -3,6 +3,7 @@ package blbl.cat3399.core.live
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionSpec
 import okhttp3.CookieJar
@@ -16,6 +17,7 @@ import okhttp3.TlsVersion
 import java.io.ByteArrayOutputStream
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 虎牙 native FLV 凭据（WUP `liveui.getCdnTokenInfoEx`）。
@@ -109,6 +111,24 @@ internal object HuyaWupToken {
 
     @Volatile
     private var blockedUntilMs = 0L
+
+    private val probeStarted = AtomicBoolean(false)
+
+    /**
+     * 诊断用：一个进程内只跑一次，把传输阶梯的实测结果写进日志。
+     *
+     * 默认改走 HLS 之后，FLV 兜底线路基本不会被选中，[fetch] 也就不会被调用，502 的成因
+     * 就永远观察不到。这里在后台线程跑一次，只写日志、不参与播放决策，也不阻塞首帧。
+     */
+    fun probeOnce(streamName: String) {
+        val name = streamName.trim()
+        if (name.isEmpty()) return
+        if (!probeStarted.compareAndSet(false, true)) return
+        Thread(
+            { runCatching { runBlocking { fetch(name) } } },
+            "huya-wup-probe",
+        ).apply { isDaemon = true }.start()
+    }
 
     /** 取 native 凭据；任何一步失败都返回 null。 */
     suspend fun fetch(streamName: String): String? =
