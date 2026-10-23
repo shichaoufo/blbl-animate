@@ -271,9 +271,16 @@ internal object HuyaApi {
         val seen = HashSet<String>()
         val flv = stream.optJSONObject("flv")?.optJSONArray("multiLine") ?: JSONArray()
         val hls = stream.optJSONObject("hls")?.optJSONArray("multiLine") ?: JSONArray()
-        for ((arr, isHls) in listOf(flv to false, hls to true)) {
+        // HLS 优先。虎牙的「短传输租约」只掐长连接：FLV 单连接约 120 秒被 CDN 主动断开，
+        // 而 HLS 是「取一次 playlist、再按分片各开一条短连接」，租约掐不到——实测同一份签名
+        // 地址连续轮询 233 秒仍然 200 且分片序号持续推进。所以默认走 HLS 就不会断流，
+        // 也就不需要换源，观感上没有黑屏也没有跳画面。
+        // FLV 保留 2 条兜底（HLS 全部取不到时仍可播），它那条会退回到「主动换签」逻辑。
+        for ((arr, isHls) in listOf(hls to true, flv to false)) {
+            var added = 0
             for (i in 0 until arr.length()) {
                 if (lines.size >= 6) break
+                if (added >= (if (isHls) 4 else 2)) break
                 val entry = arr.optJSONObject(i) ?: continue
                 val cdn = entry.optString("cdnType").trim()
                 if (cdn.isBlank()) continue
@@ -282,9 +289,9 @@ internal object HuyaApi {
                 val antiCode = base.optString(if (isHls) "sHlsAntiCode" else "sFlvAntiCode")
                 val streamName = base.optString("sStreamName").trim()
                 if (baseUrl.isBlank() || streamName.isBlank()) continue
-                // FLV 优先用 native 凭据：web antiCode 签出的地址在连接建立约 120 秒后被 CDN
-                // 主动断开（实测 120.8s，正常 EOF、不报错），native 凭据只约束新建连接，
-                // 不会掐断已建立的连接（实测 210s 无 EOF）。
+                // FLV 兜底线路优先用 native 凭据：web antiCode 签出的地址在连接建立约 120 秒后
+                // 被 CDN 主动断开（实测 120.8s，正常 EOF、不报错），native 凭据只约束新建连接，
+                // 不会掐断已建立的连接（实测 210s 无 EOF）。走 HLS 时用不到它。
                 val url =
                     (
                         if (isHls) {
@@ -299,6 +306,7 @@ internal object HuyaApi {
                     ) ?: continue
                 if (seen.add(url)) {
                     lines.add(BiliApi.LivePlayLine(order = lines.size + 1, url = url))
+                    added++
                 }
             }
         }
