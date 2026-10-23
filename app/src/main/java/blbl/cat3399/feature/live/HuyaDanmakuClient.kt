@@ -150,7 +150,13 @@ class HuyaDanmakuClient(
             response: Response,
         ) {
             onStatus("虎牙弹幕已连接")
-            AppLog.i("HuyaWs", "open room=$roomId register uid=$presenterUid")
+            AppLog.i("HuyaWs", "open room=$roomId register uid=$presenterUid code=${response.code}")
+            // 诊断：把握手响应头落下来。PC 端用同样的报文能收到推送，设备端只有 cmd=17/21，
+            // 需要看服务端在这条连接上回了什么（server / 有无 x- 头 / 是否被降级）。
+            AppLog.i(
+                "HuyaWs",
+                "handshake headers=" + response.headers.joinToString("; ") { "${it.first}=${it.second.take(30)}" },
+            )
             if (presenterUid <= 0L) {
                 AppLog.w("HuyaWs", "presenterUid=0 → 分组注册成 live:0/chat:0，服务端不会推这个房间")
             }
@@ -163,6 +169,14 @@ class HuyaDanmakuClient(
             )
             runCatching { ws?.send(ByteString.of(*heartbeat())) }
             startHeartbeat()
+        }
+
+        override fun onMessage(
+            webSocket: WebSocket,
+            text: String,
+        ) {
+            // 虎牙正常走二进制帧；万一某些节点改推文本帧，这里至少能留下痕迹。
+            AppLog.w("HuyaWs", "text frame len=${text.length} head=${text.take(60)}")
         }
 
         override fun onMessage(
