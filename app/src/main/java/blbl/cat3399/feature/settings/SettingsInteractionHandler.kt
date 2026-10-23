@@ -911,7 +911,10 @@ class SettingsInteractionHandler(
                     items = options.map { it.toString() },
                     current = prefs.danmakuTextSizeSp.toInt().toString(),
                 ) { selected ->
-                    prefs.danmakuTextSizeSp = (selected.toIntOrNull() ?: 18).toFloat().coerceIn(10f, 60f)
+                    prefs.danmakuTextSizeSp =
+                        (selected.toIntOrNull() ?: AppPrefs.DANMAKU_TEXT_SIZE_SP_DEFAULT.toInt())
+                            .toFloat()
+                            .coerceIn(10f, 60f)
                     renderer.refreshSection(entry.id)
                 }
             }
