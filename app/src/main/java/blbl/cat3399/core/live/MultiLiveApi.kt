@@ -169,6 +169,22 @@ internal object MultiLiveApi {
         return playUrl(call.site, call.roomId, call.qualityId, call.highBitrateEnabled)
     }
 
+    /**
+     * 强制现签一次最近一次 [playUrl] 的地址（不吃预取缓存）。
+     *
+     * HLS 的 playlist 要周期性重取，而虎牙的签名地址实测同一份签名约 125 秒后开始回 403
+     * （ci.34 真机两条线路各一次：131s / 132s，与请求频次无关；PC 端 1s 间隔轮询同样在 125s
+     * 挂掉）。换源会把播放位置重置到直播边缘、画面跳一下，所以改由数据源层把 playlist 的
+     * URI 就地换成「新签的同一条线路地址」，播放不中断。每次替换必须是真·新签名，不能复用
+     * 预取里那份可能已经放了两分钟的。
+     */
+    suspend fun renewLastPlayUrl(): BiliApi.LivePlayUrl? {
+        val call = lastPlayUrlCall ?: return null
+        return runCatching {
+            fetchPlayUrl(call.site, call.roomId, call.qualityId, call.highBitrateEnabled)
+        }.getOrNull()
+    }
+
     /** 未选择清晰度时的默认清晰度 id。 */
     fun defaultQualityId(site: LiveSite): Int =
         when (site) {
