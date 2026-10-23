@@ -295,6 +295,9 @@ internal object HuyaApi {
                 val url =
                     (
                         if (isHls) {
+                            // 顺便跑一次 WUP 诊断（一个进程只跑一次、不阻塞首帧），
+                            // 否则默认走 HLS 之后那条约 502 的日志就再也看不到了。
+                            HuyaWupToken.probeOnce(streamName)
                             runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, true) }.getOrNull()
                         } else {
                             // 只给第一条线路用 native：既拿到「不会被掐断」的那条，又保留其余
