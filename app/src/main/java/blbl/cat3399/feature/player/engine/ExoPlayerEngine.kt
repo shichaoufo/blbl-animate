@@ -56,6 +56,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -421,6 +422,7 @@ internal class ExoPlayerEngine(
                 val factory = createCdnFactory(DebugStreamKind.MAIN, urlCandidates = listOf(url))
 
                 val isM3u8 = url.substringBefore('?').trim().lowercase(Locale.US).endsWith(".m3u8")
+                var flvSpliced = false
                 if (isM3u8) {
                     val playlistPath = url.substringBefore('?')
                     val hlsFactory =
@@ -441,14 +443,29 @@ internal class ExoPlayerEngine(
                             .setPlaylistParserFactory(liveHlsPlaylistParserFactory)
                             .createMediaSource(MediaItem.fromUri(uri))
                     exoPlayer.setMediaSource(hlsSource)
+                } else if (isHuyaFlv(url)) {
+                    // 虎牙 web 签名 FLV 的连接租约约 120 秒。不再让播放器断线重连，改由数据源在
+                    // FLV 标签层接流：到期之前签好新地址并连上、在关键帧处衔接时间戳，播放器
+                    // 自始至终只看到一条连续流——无 EOF、无 seek、缓冲不清空、解码器不重启。
+                    // （之前所有「断了再 setSource」的做法都会重建播放器，就是「一跳一卡」的来源。）
+                    flvSpliced = true
+                    val spliceFactory =
+                        FlvSpliceDataSourceFactory(
+                            upstreamFactory = factory,
+                            renew = { renewHuyaFlvUrl(url) },
+                            rotateAfterMs = FLV_SPLICE_ROTATE_MS,
+                        )
+                    AppLog.i("LivePlayer", "flv splice on rotate=${FLV_SPLICE_ROTATE_MS}ms")
+                    exoPlayer.setMediaSource(
+                        DefaultMediaSourceFactory(spliceFactory).createMediaSource(MediaItem.fromUri(uri)),
+                    )
                 } else {
                     val mediaSourceFactory = DefaultMediaSourceFactory(factory)
                     val mediaSource = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
                     exoPlayer.setMediaSource(mediaSource)
                 }
-                // 短租约地址（虎牙 web 签名的 FLV 长连接）在断流之前主动换签；HLS 分片短连接
-                // 与 native 凭据（huya_pc_exe）都不会被掐断，不需要切换。
-                if (needsLeaseSwitch(url)) scheduleLeaseSwitch(url) else cancelLeaseSwitch()
+                // 已经由数据源层接流的源不需要播放器换源（换源会清空缓冲、重建解码器）。
+                if (!flvSpliced && needsLeaseSwitch(url)) scheduleLeaseSwitch(url) else cancelLeaseSwitch()
             }
         }
     }
@@ -597,6 +614,28 @@ internal class ExoPlayerEngine(
         if (!host.contains("huya")) return false
         val path = uri.path?.lowercase(Locale.US).orEmpty()
         return path.endsWith(".m3u8")
+    }
+
+    private fun isHuyaFlv(url: String): Boolean {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val host = uri.host?.lowercase(Locale.US).orEmpty()
+        if (!host.contains("huya")) return false
+        val path = uri.path?.lowercase(Locale.US).orEmpty()
+        return path.endsWith(".flv")
+    }
+
+    /**
+     * 给 [FlvSpliceDataSource] 取一条**新签名**的同一路 FLV 地址。
+     *
+     * 必须用 [MultiLiveApi.renewLastPlayUrl] 强制现签，不能吃预取缓存：缓存里的签名可能已经
+     * 放了 90 秒，而虎牙同一份签名约 125 秒后就开始回 403，换线会直接失败。
+     */
+    private fun renewHuyaFlvUrl(currentUrl: String): String? {
+        val fresh = runCatching { runBlocking { MultiLiveApi.renewLastPlayUrl() } }.getOrNull() ?: return null
+        val flv = fresh.lines.filter { it.url.substringBefore('?').lowercase(Locale.US).endsWith(".flv") }
+        if (flv.isEmpty()) return null
+        val path = currentUrl.substringBefore('?')
+        return (flv.firstOrNull { it.url.substringBefore('?') == path } ?: flv.first()).url
     }
 
     /**
@@ -1178,6 +1217,14 @@ private const val LIVE_RECONNECT_MIN_GAP_MS = 3_000L
 
 /** 短租约直播在连接建立多久后主动换签：虎牙实测约 120s 断流，留 20s 余量。 */
 private const val LIVE_LEASE_SWITCH_MS = 100_000L
+
+/**
+ * 虎牙 FLV 的接流周期。
+ *
+ * web 签名（`ctype=huya_webh5`）的连接实测约 120.7 秒被 CDN EOF，留 45 秒余量取 75 秒：
+ * 在断流之前就把新连接接上，播放器永远看不到 EOF。每次换线只多一条连接、一次接口往返。
+ */
+private const val FLV_SPLICE_ROTATE_MS = 75_000L
 
 /** HLS playlist 的续签间隔：虎牙同一份签名实测约 125s 后开始 403，取一半留余量。 */
 private const val HLS_RENEW_INTERVAL_MS = 45_000L
