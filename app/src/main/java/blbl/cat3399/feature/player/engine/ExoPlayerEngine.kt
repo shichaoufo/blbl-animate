@@ -37,6 +37,7 @@ import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.ParsingLoadable
+import blbl.cat3399.core.api.BiliApi
 import blbl.cat3399.core.api.video.VideoMediaRequestProfile
 import blbl.cat3399.core.live.MultiLiveApi
 import blbl.cat3399.core.log.AppLog
@@ -48,8 +49,10 @@ import blbl.cat3399.feature.player.DebugStreamKind
 import blbl.cat3399.feature.player.Playable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
@@ -121,6 +124,9 @@ internal class ExoPlayerEngine(
     private var liveReconnectCount = 0
     private var liveReconnectWindowStartMs = 0L
     private var liveReconnectInFlight = false
+
+    /** 断流前主动换签的任务（短租约地址专用）。 */
+    private var liveSwitchJob: Job? = null
 
     private var seamlessQualitySource: Boolean = false
     private var seamlessAvailableQns: Set<Int> = emptySet()
@@ -395,6 +401,9 @@ internal class ExoPlayerEngine(
                     val mediaSource = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
                     exoPlayer.setMediaSource(mediaSource)
                 }
+                // 短租约地址（虎牙 web FLV/HLS）在断流之前主动换签；native 凭据（huya_pc_exe）
+                // 不会被掐断，不需要切换。
+                if (needsLeaseSwitch(url)) scheduleLeaseSwitch(url) else cancelLeaseSwitch()
             }
         }
     }
@@ -442,6 +451,7 @@ internal class ExoPlayerEngine(
         liveReconnectCount++
         liveReconnectInFlight = true
         val previousUrl = source.url
+        cancelLeaseSwitch()
         AppLog.i("LiveReconnect", "stream ended, refreshing url (${liveReconnectCount})")
         scope.launch {
             try {
@@ -462,6 +472,68 @@ internal class ExoPlayerEngine(
                 liveReconnectInFlight = false
             }
         }
+    }
+
+    /**
+     * 短租约直播地址的「提前换签」。
+     *
+     * 虎牙 web FLV/HLS 的连接在建立约 120 秒后被 CDN 主动断开。等 ENDED 再重连会有约 1 秒
+     * 空档（播放器要把缓冲耗尽才判定结束），观感是「卡一下再跳一下」。这里在断流之前
+     * （[LIVE_LEASE_SWITCH_MS]）就换到预取好的新地址：两边都是直播的当前画面，内容连续，
+     * 只剩解码器重启的零点几秒；配合 PlayerView 的 keepContentOnPlayerReset 只是「停一帧」。
+     */
+    private fun scheduleLeaseSwitch(currentUrl: String) {
+        cancelLeaseSwitch()
+        liveSwitchJob =
+            scope.launch {
+                delay(LIVE_LEASE_SWITCH_MS)
+                if (currentSource !is PlaybackSource.Live) return@launch
+                // 暂停中不要抢播：切源会自动开播，等于替用户点了播放。
+                if (!exoPlayer.playWhenReady) return@launch
+                val fresh = runCatching { MultiLiveApi.refreshLastPlayUrl() }.getOrNull() ?: return@launch
+                val next = pickLiveUrl(fresh, currentUrl) ?: return@launch
+                liveSwitchJob = null // 避免 applyLiveUrl -> setSource 时自取消
+                AppLog.i("LiveReconnect", "proactive switch before lease expiry")
+                applyLiveUrl(next)
+            }
+    }
+
+    private fun cancelLeaseSwitch() {
+        liveSwitchJob?.cancel()
+        liveSwitchJob = null
+    }
+
+    private fun applyLiveUrl(url: String) {
+        setSource(PlaybackSource.Live(url = url))
+        exoPlayer.prepare()
+        exoPlayer.play()
+    }
+
+    /** 优先同一条 CDN 线路（URL path 相同），否则取第一条。 */
+    private fun pickLiveUrl(
+        fresh: BiliApi.LivePlayUrl?,
+        previousUrl: String,
+    ): String? {
+        val previousPath = previousUrl.substringBefore('?')
+        return fresh
+            ?.lines
+            ?.firstOrNull { it.url.substringBefore('?') == previousPath }
+            ?.url
+            ?: fresh?.lines?.firstOrNull()?.url
+    }
+
+    /**
+     * 是否为「短传输租约」地址：虎牙域名下的 FLV/HLS，且不是 native 凭据
+     * （`ctype=huya_pc_exe`）。判定与 PureLive 的 `hasShortTransportLease` 一致。
+     * 斗鱼（租约由 URL 的 `expire` 声明）与 B 站不属于此类。
+     */
+    private fun needsLeaseSwitch(url: String): Boolean {
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val host = uri.host?.lowercase(Locale.US).orEmpty()
+        if (!host.contains("huya")) return false
+        val path = uri.path?.lowercase(Locale.US).orEmpty()
+        if (!path.endsWith(".flv") && !path.endsWith(".m3u8")) return false
+        return uri.getQueryParameter("ctype") != "huya_pc_exe"
     }
 
     override fun addListener(listener: BlblPlayerEngine.Listener) {
@@ -953,6 +1025,9 @@ private const val LIVE_HLS_DEBUG_RECENT_SEGMENT_COUNT = 3
 /** 直播续流窗口：这段时间内最多重连 [LIVE_RECONNECT_MAX] 次。 */
 private const val LIVE_RECONNECT_WINDOW_MS = 5 * 60 * 1000L
 private const val LIVE_RECONNECT_MAX = 8
+
+/** 短租约直播在连接建立多久后主动换签：虎牙实测约 120s 断流，留 20s 余量。 */
+private const val LIVE_LEASE_SWITCH_MS = 100_000L
 
 private class BlblRenderersFactory(
     context: Context,
