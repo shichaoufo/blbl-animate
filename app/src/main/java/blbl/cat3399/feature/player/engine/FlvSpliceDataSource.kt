@@ -91,7 +91,6 @@ class FlvSpliceDataSource(
     override fun close() {
         resetState()
         closeUpstream()
-        transferEnd()
     }
 
     // ------------------------------------------------------------------ 主循环
