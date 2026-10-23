@@ -1182,17 +1182,41 @@ private class PlaylistRateLimitDataSource(
     private val playlistPath: String,
     private val minIntervalMs: Long,
 ) : DataSource {
-    private var lastOpenAtMs = 0L
-
     override fun open(dataSpec: DataSpec): Long {
-        if (dataSpec.uri.toString().substringBefore('?') == playlistPath) {
-            if (lastOpenAtMs > 0L) {
-                val waitMs = minIntervalMs - (SystemClock.elapsedRealtime() - lastOpenAtMs)
+        val isPlaylist = dataSpec.uri.toString().substringBefore('?') == playlistPath
+        if (isPlaylist) {
+            // 上次打开时间必须跨实例共享：ExoPlayer 每次 load 都会 createDataSource() 新建实例，
+            // 用实例字段记的话限速器等于没开（ci.38 的 playlist 403 就是这么来的）。
+            val last = lastPlaylistOpenAtMs
+            if (last > 0L) {
+                val waitMs = minIntervalMs - (SystemClock.elapsedRealtime() - last)
                 if (waitMs > 0L) runCatching { Thread.sleep(waitMs) }
             }
-            lastOpenAtMs = SystemClock.elapsedRealtime()
+            lastPlaylistOpenAtMs = SystemClock.elapsedRealtime()
+            var n = 0
+            runCatching { n = playlistOpenCount.incrementAndGet() }
+            return try {
+                val len = upstream.open(dataSpec)
+                if (n <= 3 || n % 10 == 0) {
+                    AppLog.i("LivePlayer", "playlist #$n ok len=$len ${queryTag(dataSpec.uri)}")
+                }
+                len
+            } catch (t: Throwable) {
+                AppLog.w(
+                    "LivePlayer",
+                    "playlist #$n fail ${t.javaClass.simpleName} ${t.message} ${queryTag(dataSpec.uri)}",
+                )
+                throw t
+            }
         }
         return upstream.open(dataSpec)
+    }
+
+    private fun queryTag(uri: Uri): String {
+        val q = uri.query ?: return "q=-"
+        fun pick(k: String) =
+            Regex("(^|&)" + k + "=([^&]*)").find(q)?.groupValues?.get(2) ?: "-"
+        return "seqid=…${pick("seqid").takeLast(8)} wsTime=${pick("wsTime")} u=${pick("u")}"
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
@@ -1206,6 +1230,11 @@ private class PlaylistRateLimitDataSource(
 
     override fun addTransferListener(transferListener: TransferListener) {
         upstream.addTransferListener(transferListener)
+    }
+
+    private companion object {
+        @Volatile private var lastPlaylistOpenAtMs = 0L
+        private val playlistOpenCount = java.util.concurrent.atomic.AtomicInteger(0)
     }
 }
 
