@@ -7,8 +7,10 @@ import kotlinx.coroutines.withContext
 import okhttp3.CookieJar
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 
@@ -43,51 +45,102 @@ internal object HuyaWupToken {
     const val NATIVE_USER_AGENT =
         "HYSDK(Windows,30000002)_APP(pc_exe&7100004&official)_SDK(trans&2.40.0.6448)"
 
+    /** 连续失败达到该次数后暂停重试，避免每轮续流空打一次请求。 */
+    private const val FAILURE_BLOCK_MS = 3 * 60 * 1000L
+
     private val CONTENT_TYPE = "application/x-wup".toMediaType()
 
     /**
-     * 独立 client：不带 B 站 cookie，也不走 apiOkHttp 的媒体链路。
-     * 仍然基于 apiOkHttp，是为了复用连接池与 DNS 配置；拦截器只填空白头，这里全部显式设置。
+     * 两个 client：先按默认协议（会协商 HTTP/2），失败再强制 HTTP/1.1。
+     *
+     * 2026-10-23 真机日志里 wup 稳定返回 502，而同网络下用 curl / Python / Node(h2) 打同一
+     * 接口都是 200，说明差异在设备侧链路而不是报文。这里把「协议降级重试」作为兜底，并把
+     * 502 的响应头与响应体记进日志，便于下次直接看出是谁返回的。
      */
-    private val client: OkHttpClient by lazy {
-        BiliClient.apiOkHttp
-            .newBuilder()
-            .cookieJar(CookieJar.NO_COOKIES)
-            .readTimeout(8, TimeUnit.SECONDS)
-            .writeTimeout(8, TimeUnit.SECONDS)
-            .build()
+    private val clients: List<Pair<String, OkHttpClient>> by lazy {
+        val base =
+            BiliClient.apiOkHttp
+                .newBuilder()
+                .cookieJar(CookieJar.NO_COOKIES)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .writeTimeout(8, TimeUnit.SECONDS)
+        listOf(
+            "h2" to base.build(),
+            "h1.1" to base.protocols(listOf(Protocol.HTTP_1_1)).build(),
+        )
     }
 
+    @Volatile
+    private var failures = 0
+
+    @Volatile
+    private var blockedUntilMs = 0L
+
     /** 取 native 凭据；任何一步失败都返回 null。 */
-    suspend fun fetch(streamName: String): String? {
-        val name = streamName.trim()
-        if (name.isEmpty()) return null
-        val body = runCatching { encodeRequest(name) }.getOrNull() ?: return null
-        val request =
-            Request.Builder()
-                .url(WUP_URL)
-                .header("content-type", "application/x-wup")
-                .header("origin", "https://www.huya.com")
-                .header("referer", "https://www.huya.com/")
-                .header("user-agent", NATIVE_USER_AGENT)
-                .post(body.toRequestBody(CONTENT_TYPE))
-                .build()
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        AppLog.w("HuyaToken", "wup http=${response.code}")
-                        return@use null
-                    }
-                    val bytes = response.body?.bytes()
-                    if (bytes == null || bytes.isEmpty()) {
-                        AppLog.w("HuyaToken", "wup empty body")
-                        return@use null
-                    }
-                    parseToken(bytes)
+    suspend fun fetch(streamName: String): String? =
+        withContext(Dispatchers.IO) {
+            val name = streamName.trim()
+            if (name.isEmpty()) return@withContext null
+            if (System.currentTimeMillis() < blockedUntilMs) return@withContext null
+            val body = runCatching { encodeRequest(name) }.getOrNull() ?: return@withContext null
+            val request = buildRequest(body)
+            var reason = ""
+            for ((label, client) in clients) {
+                val token =
+                    runCatching {
+                        client.newCall(request).execute().use { response ->
+                            if (!response.isSuccessful) {
+                                reason = "$label ${describe(response)}"
+                                return@use null
+                            }
+                            val bytes = response.body?.bytes()
+                            if (bytes == null || bytes.isEmpty()) {
+                                reason = "$label empty body"
+                                return@use null
+                            }
+                            parseToken(bytes).also { parsed ->
+                                if (parsed == null) reason = "$label token unparsable"
+                            }
+                        }
+                    }.onFailure {
+                        reason = "$label ${it::class.java.simpleName}: ${it.message}"
+                    }.getOrNull()
+                if (token != null) {
+                    failures = 0
+                    blockedUntilMs = 0L
+                    return@withContext token
                 }
-            }.onFailure { AppLog.w("HuyaToken", "wup request failed", it) }.getOrNull()
+            }
+            failures++
+            if (failures >= 2) blockedUntilMs = System.currentTimeMillis() + FAILURE_BLOCK_MS
+            AppLog.w("HuyaToken", "native token failed [$reason] failures=$failures")
+            null
         }
+
+    private fun buildRequest(body: ByteArray): Request =
+        Request.Builder()
+            .url(WUP_URL)
+            .header("content-type", "application/x-wup")
+            .header("origin", "https://www.huya.com")
+            .header("referer", "https://www.huya.com/")
+            .header("user-agent", NATIVE_USER_AGENT)
+            .post(body.toRequestBody(CONTENT_TYPE))
+            .build()
+
+    /** 失败时的诊断串：状态码 + 网关标识 + 响应体可打印前缀（502 时能看出是谁挡的）。 */
+    private fun describe(response: Response): String {
+        val server = response.header("server").orEmpty()
+        val via = response.header("via").orEmpty()
+        val cache = response.header("x-cache").orEmpty()
+        val snippet =
+            runCatching {
+                val bytes = response.body?.bytes() ?: return@runCatching ""
+                String(bytes, Charsets.ISO_8859_1)
+                    .filter { it.code in 32..126 }
+                    .take(100)
+                    .trim()
+            }.getOrDefault("")
+        return "http=${response.code} server=$server via=$via cache=$cache body=$snippet"
     }
 
     /**
@@ -101,10 +154,7 @@ internal object HuyaWupToken {
         // ISO-8859-1 保证字节与字符 1:1，便于按可打印区间截取。
         val text = String(bytes, Charsets.ISO_8859_1)
         val start = text.indexOf("wsSecret=")
-        if (start < 0) {
-            AppLog.w("HuyaToken", "wup response without token (${bytes.size}B)")
-            return null
-        }
+        if (start < 0) return null
         var end = start
         while (end < text.length) {
             val code = text[end].code
@@ -112,11 +162,7 @@ internal object HuyaWupToken {
             end++
         }
         val token = text.substring(start, end).trim()
-        if (!token.contains("ctype=huya_pc_exe")) {
-            AppLog.w("HuyaToken", "unexpected token shape: ${token.take(80)}")
-            return null
-        }
-        return token
+        return token.takeIf { it.contains("ctype=huya_pc_exe") }
     }
 
     // ---------------------------------------------------------------- 报文编码
