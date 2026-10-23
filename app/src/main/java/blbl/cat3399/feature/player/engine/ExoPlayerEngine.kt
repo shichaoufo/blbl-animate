@@ -421,7 +421,7 @@ internal class ExoPlayerEngine(
                     val hlsFactory =
                         if (isHuyaHls(url)) {
                             startHlsRenew(playlistPath)
-                            renewingFactory(factory, playlistPath)
+                            renewingFactory(throttledFactory(factory, playlistPath), playlistPath)
                         } else {
                             factory
                         }
@@ -600,6 +600,15 @@ internal class ExoPlayerEngine(
                 }
                 dataSpec.withUri(renewed)
             }
+        }
+
+    private fun throttledFactory(factory: DataSource.Factory, playlistPath: String): DataSource.Factory =
+        DataSource.Factory {
+            PlaylistRateLimitDataSource(
+                upstream = factory.createDataSource(),
+                playlistPath = playlistPath,
+                minIntervalMs = HLS_PLAYLIST_MIN_INTERVAL_MS,
+            )
         }
 
     private fun renewedPlaylistUri(uri: Uri): Uri? {
@@ -1158,6 +1167,47 @@ private const val HLS_RENEW_MAX_AGE_MS = 150_000L
 
 /** 连续多次拿不到同线路新地址（房间下播 / 接口异常）就停下，避免无意义地轮询。 */
 private const val HLS_RENEW_MAX_MISSES = 4
+
+/**
+ * 同一份 HLS playlist 的最小请求间隔。
+ *
+ * 虎牙的 playlist 只有一两片 4 秒分片，播放器为了尽早拿到下一片会几乎每秒重取一次；
+ * CDN 对这串请求有预算，耗尽就 403（ci.34 真机实测 131s、PC 端 1s 间隔约 100 次请求 125s，
+ * 而 5s 间隔 233s 仍 200）。把间隔补足到 3 秒，播放器逻辑不用改，请求数降到 1/3。
+ */
+private const val HLS_PLAYLIST_MIN_INTERVAL_MS = 3_000L
+
+private class PlaylistRateLimitDataSource(
+    private val upstream: DataSource,
+    private val playlistPath: String,
+    private val minIntervalMs: Long,
+) : DataSource {
+    private var lastOpenAtMs = 0L
+
+    override fun open(dataSpec: DataSpec): Long {
+        if (dataSpec.uri.toString().substringBefore('?') == playlistPath) {
+            if (lastOpenAtMs > 0L) {
+                val waitMs = minIntervalMs - (SystemClock.elapsedRealtime() - lastOpenAtMs)
+                if (waitMs > 0L) runCatching { Thread.sleep(waitMs) }
+            }
+            lastOpenAtMs = SystemClock.elapsedRealtime()
+        }
+        return upstream.open(dataSpec)
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+        upstream.read(buffer, offset, length)
+
+    override fun getUri(): Uri? = upstream.uri
+
+    override fun close() {
+        upstream.close()
+    }
+
+    override fun addTransferListener(transferListener: TransferListener) {
+        upstream.addTransferListener(transferListener)
+    }
+}
 
 private class BlblRenderersFactory(
     context: Context,
