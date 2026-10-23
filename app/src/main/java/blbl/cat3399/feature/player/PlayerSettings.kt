@@ -1072,7 +1072,7 @@ internal fun PlayerActivity.showDanmakuTextSizeDialog() {
     val options = PlaybackSettingChoices.danmakuTextSizes
     val current =
         options.indices.minByOrNull { kotlin.math.abs(options[it].toFloat() - session.danmaku.textSizeSp) }
-            ?: options.indexOf(18).takeIf { it >= 0 }
+            ?: options.indexOf(AppPrefs.DANMAKU_TEXT_SIZE_SP_DEFAULT.toInt()).takeIf { it >= 0 }
             ?: 0
     showSettingsChoiceDialog(
         title = "弹幕字体大小",
