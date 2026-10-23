@@ -18,6 +18,7 @@ import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.okhttp.OkHttpDataSource
@@ -58,6 +59,7 @@ import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
@@ -125,6 +127,9 @@ internal class ExoPlayerEngine(
     private var liveReconnectCount = 0
     private var liveReconnectWindowStartMs = 0L
     private var liveReconnectInFlight = false
+
+    /** 上一次续流的时间点：两次续流之间至少隔 [LIVE_RECONNECT_MIN_GAP_MS]，避免 1.5 秒一次的重连抖动。 */
+    private var liveReconnectLastAtMs = 0L
 
     /** 断流前主动换签的任务（短租约地址专用）。 */
     private var liveSwitchJob: Job? = null
@@ -421,7 +426,13 @@ internal class ExoPlayerEngine(
                     val hlsFactory =
                         if (isHuyaHls(url)) {
                             startHlsRenew(playlistPath)
-                            renewingFactory(throttledFactory(factory, playlistPath), playlistPath)
+                            // 顺序有讲究：retry 必须在最外层，这样每次重试都会重新走一遍
+                            // ResolvingDataSource，拿到刚续签出来的最新地址（否则重试的还是那张被
+                            // 403 的 URL）。
+                            RetryingDataSourceFactory(
+                                renewingFactory(throttledFactory(factory, playlistPath), playlistPath),
+                                HLS_RETRY_DELAYS_MS,
+                            )
                         } else {
                             factory
                         }
@@ -484,10 +495,16 @@ internal class ExoPlayerEngine(
         }
         liveReconnectCount++
         liveReconnectInFlight = true
+        // 两次续流之间至少隔 [LIVE_RECONNECT_MIN_GAP_MS]：ci.40 里 FLV 线路 1.7 秒就 EOF，
+        // 续流无节流 → 每 1.5 秒 setSource 一次，画面被抓着反复重置，观感就是「一跳一卡」。
+        val gapMs = (now - liveReconnectLastAtMs).coerceAtLeast(0L)
+        val waitMs = (LIVE_RECONNECT_MIN_GAP_MS - gapMs).coerceAtLeast(0L)
+        liveReconnectLastAtMs = now + waitMs
         val previousUrl = source.url
         cancelLeaseSwitch()
-        AppLog.i("LiveReconnect", "stream ended, refreshing url (${liveReconnectCount})")
+        AppLog.i("LiveReconnect", "stream ended, refreshing url (${liveReconnectCount}) wait=${waitMs}ms")
         scope.launch {
+            if (waitMs > 0L) delay(waitMs)
             try {
                 val fresh = runCatching { MultiLiveApi.refreshLastPlayUrl() }.getOrNull()
                 val previousPath = previousUrl.substringBefore('?')
@@ -1156,6 +1173,9 @@ private const val LIVE_HLS_DEBUG_RECENT_SEGMENT_COUNT = 3
 private const val LIVE_RECONNECT_WINDOW_MS = 5 * 60 * 1000L
 private const val LIVE_RECONNECT_MAX = 8
 
+/** 两次续流的最小间隔。低于这个值等于不停地 setSource，画面会被反复重置。 */
+private const val LIVE_RECONNECT_MIN_GAP_MS = 3_000L
+
 /** 短租约直播在连接建立多久后主动换签：虎牙实测约 120s 断流，留 20s 余量。 */
 private const val LIVE_LEASE_SWITCH_MS = 100_000L
 
@@ -1176,6 +1196,12 @@ private const val HLS_RENEW_MAX_MISSES = 4
  * 而 5s 间隔 233s 仍 200）。把间隔补足到 3 秒，播放器逻辑不用改，请求数降到 1/3。
  */
 private const val HLS_PLAYLIST_MIN_INTERVAL_MS = 3_000L
+
+/**
+ * 虎牙 HLS 单个请求失败后的重试间隔。CDN 偶发的 403 基本都是瞬时的（换签瞬间 / 请求密集），
+ * 睡一下重开就过去了；不重试就会冒成 `ERROR_CODE_IO_BAD_HTTP_STATUS` 触发换线。
+ */
+private val HLS_RETRY_DELAYS_MS = longArrayOf(1_200L, 2_500L)
 
 private class PlaylistRateLimitDataSource(
     private val upstream: DataSource,
@@ -1236,6 +1262,61 @@ private class PlaylistRateLimitDataSource(
         @Volatile private var lastPlaylistOpenAtMs = 0L
         private val playlistOpenCount = java.util.concurrent.atomic.AtomicInteger(0)
     }
+}
+
+/**
+ * 直播 IO 错误在上游重试，**不让它抛到 ExoPlayer**。
+ *
+ * 虎牙 CDN 偶尔会对单个 playlist/分片请求回 403（换签完成瞬间、或同一 IP 请求密集时）。
+ * 这种失败交给 ExoPlayer 就会走 `DefaultLoadErrorHandlingPolicy`：4xx 不重试、直接抛
+ * `InvalidResponseCodeException` → `autoFailover` 换线 → `position discontinuity` + 「线路 x
+ * 失败」提示 + 画面跳变（ci.34/ci.39 真机日志）。在 DataSource 这一层睡一下重开，行为上等价于
+ * 「网络抖了一下」，用户无感。
+ */
+private class RetryDataSource(
+    private val upstream: DataSource,
+    private val delaysMs: LongArray,
+) : DataSource {
+    override fun addTransferListener(transferListener: TransferListener) {
+        upstream.addTransferListener(transferListener)
+    }
+
+    override fun open(dataSpec: DataSpec): Long {
+        var attempt = 0
+        while (true) {
+            try {
+                return upstream.open(dataSpec)
+            } catch (e: IOException) {
+                if (attempt >= delaysMs.size) throw e
+                runCatching { upstream.close() }
+                val delayMs = delaysMs[attempt]
+                AppLog.w(
+                    "LivePlayer",
+                    "retry ${attempt + 1}/${delaysMs.size} in ${delayMs}ms " +
+                        "err=${e.javaClass.simpleName} code=${(e as? HttpDataSource.InvalidResponseCodeException)?.responseCode ?: -1} " +
+                        "path=${dataSpec.uri.toString().substringBefore('?').takeLast(36)}",
+                )
+                runCatching { Thread.sleep(delayMs) }
+                attempt++
+            }
+        }
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+        upstream.read(buffer, offset, length)
+
+    override fun getUri(): Uri? = upstream.uri
+
+    override fun close() {
+        upstream.close()
+    }
+}
+
+private class RetryingDataSourceFactory(
+    private val upstream: DataSource.Factory,
+    private val delaysMs: LongArray,
+) : DataSource.Factory {
+    override fun createDataSource(): DataSource = RetryDataSource(upstream.createDataSource(), delaysMs)
 }
 
 private class BlblRenderersFactory(
