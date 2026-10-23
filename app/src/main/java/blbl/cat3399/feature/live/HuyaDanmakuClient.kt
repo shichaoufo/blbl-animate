@@ -10,6 +10,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
@@ -45,6 +46,10 @@ class HuyaDanmakuClient(
     private var ws: WebSocket? = null
     @Volatile private var closed = false
     @Volatile private var reconnectAttempt = 0
+
+    /** 诊断：收到多少帧 / 解出多少条弹幕，用来区分「没推」和「解不出来」。 */
+    private val frameCount = AtomicInteger(0)
+    private val chatCount = AtomicInteger(0)
 
     private var heartbeatTask: ScheduledFuture<*>? = null
     private var silenceTask: ScheduledFuture<*>? = null
@@ -135,6 +140,10 @@ class HuyaDanmakuClient(
             response: Response,
         ) {
             onStatus("虎牙弹幕已连接")
+            AppLog.i("HuyaWs", "open room=$roomId register uid=$presenterUid")
+            if (presenterUid <= 0L) {
+                AppLog.w("HuyaWs", "presenterUid=0 → 分组注册成 live:0/chat:0，服务端不会推这个房间")
+            }
             webSocket.send(ByteString.of(*register(presenterUid)))
             runCatching { ws?.send(ByteString.of(*heartbeat())) }
             startHeartbeat()
@@ -144,6 +153,10 @@ class HuyaDanmakuClient(
             webSocket: WebSocket,
             bytes: ByteString,
         ) {
+            val n = frameCount.incrementAndGet()
+            if (n <= 5 || n % 50 == 0) {
+                AppLog.i("HuyaWs", "frame #$n len=${bytes.size} chats=${chatCount.get()}")
+            }
             runCatching { handleFrame(bytes.toByteArray()) }
                 .onFailure { AppLog.w("HuyaWs", "handle frame failed", it) }
         }
@@ -205,7 +218,11 @@ class HuyaDanmakuClient(
         body: ByteArray?,
     ) {
         when (uri) {
-            URI_CHAT -> parseChat(body)?.let(onDanmaku)
+            URI_CHAT ->
+                parseChat(body)?.let {
+                    chatCount.incrementAndGet()
+                    onDanmaku(it)
+                }
             URI_END -> onStatus("主播已下播")
             else -> Unit
         }
