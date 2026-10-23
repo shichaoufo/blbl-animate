@@ -271,17 +271,19 @@ internal object HuyaApi {
         val seen = HashSet<String>()
         val flv = stream.optJSONObject("flv")?.optJSONArray("multiLine") ?: JSONArray()
         val hls = stream.optJSONObject("hls")?.optJSONArray("multiLine") ?: JSONArray()
-        // HLS 优先，FLV（web 签名）兜底。依据（2026-10-23 多轮真机对照）：
-        // 1) ci.37（HLS 优先 + 每 45s 就地续签）真机连续 5 分 38 秒零故障、零换线，是至今
-        //    最好的一轮；ci.39 那次 137 秒后 403 已确认是本地压测同时打同一公网 IP 造成的。
-        // 2) FLV(native 凭据，ctype=huya_pc_exe) 在 PC 上稳定，但真机上第一条就 403、
-        //    第二条 1.7 秒 EOF，触发 LiveReconnect 每 1.5 秒重连一次的抖动循环（ci.40 日志），
-        //    所以不能放主路径。FLV 只保留 web 签名窗口期兜底（约 120 秒，由引擎主动换签）。
-        for ((arr, isHls) in listOf(hls to true, flv to false)) {
+        // FLV 优先，HLS 兜底（2026-10-23 起）。
+        //
+        // 1) FLV 是一条长连接，换线成本可以做到「零」：播放器侧由 FlvSpliceDataSource 在标签层
+        //    接流（到期前签新地址 + 关键帧对齐 + 时间戳平移），播放器看不到 EOF，缓冲不清空、
+        //    解码器不重启。HLS 每条分片都是一次请求，换线只能靠 setSource 重建播放器，必然跳变。
+        // 2) HLS 还有「请求预算」问题：同一 IP/u 约 100 次请求后整链路 403，换签也救不回来，
+        //    只能靠限速 + 续签 + 重试把 403 往后推，属于折中；FLV 每 75 秒才一次请求。
+        // 3) HLS 保留 2 条作为「FLV 连不上」时的兜底。
+        for ((arr, isHls) in listOf(flv to false, hls to true)) {
             var added = 0
             for (i in 0 until arr.length()) {
                 if (lines.size >= 6) break
-                if (added >= (if (isHls) 4 else 2)) break
+                if (added >= (if (isHls) 2 else 4)) break
                 val entry = arr.optJSONObject(i) ?: continue
                 val cdn = entry.optString("cdnType").trim()
                 if (cdn.isBlank()) continue
@@ -290,7 +292,7 @@ internal object HuyaApi {
                 val antiCode = base.optString(if (isHls) "sHlsAntiCode" else "sFlvAntiCode")
                 val streamName = base.optString("sStreamName").trim()
                 if (baseUrl.isBlank() || streamName.isBlank()) continue
-                // HLS 用 antiCode 现签；FLV 兜底同样用 web antiCode（native 凭据在真机 403，见上）。
+                // FLV 主路径同样用 web antiCode 现签（native 凭据在真机 403，见上）。
                 val url =
                     (
                         if (isHls) {
@@ -299,7 +301,7 @@ internal object HuyaApi {
                             HuyaWupToken.probeOnce(streamName)
                             runCatching { mediaUrl(baseUrl, streamName, antiCode, bitRate, true) }.getOrNull()
                         } else {
-                            // FLV 兜底一律用 web antiCode 签名。native 凭据（ctype=huya_pc_exe）在 PC
+                            // FLV 主路径一律用 web antiCode 签名。native 凭据（ctype=huya_pc_exe）在 PC
                             // 上能连 300 秒，但真机上第一批请求就 403、随后 1.7 秒 EOF（ci.40 日志），
                             // 所以默认关闭；留开关方便以后 A/B。
                             val native = if (nativeFlvEnabled) nativeFlvUrl(baseUrl, streamName, bitRate) else null
