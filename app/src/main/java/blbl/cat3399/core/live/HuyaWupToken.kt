@@ -102,7 +102,16 @@ internal object HuyaWupToken {
                     .connectionSpecs(listOf(tls12))
                     .build(),
             ),
-            Attempt("http", WUP_URL_PLAIN, base.protocols(listOf(Protocol.HTTP_1_1)).build()),
+            Attempt(
+                "http",
+                WUP_URL_PLAIN,
+                base
+                    .protocols(listOf(Protocol.HTTP_1_1))
+                    // 必须显式加上 CLEARTEXT，否则 OkHttp 直接抛
+                    // 「CLEARTEXT communication not enabled for client」而不发请求。
+                    .connectionSpecs(listOf(ConnectionSpec.CLEARTEXT))
+                    .build(),
+            ),
         )
     }
 
@@ -137,6 +146,10 @@ internal object HuyaWupToken {
             if (name.isEmpty()) return@withContext null
             if (System.currentTimeMillis() < blockedUntilMs) return@withContext null
             val body = runCatching { encodeRequest(name) }.getOrNull() ?: return@withContext null
+            // 设备上三档 HTTPS 都是 502（server 还是虎牙自己的 HUYA/2.15.3），而同网络下
+            // PC 用同一份报文是 200。把这行 MD5 拿去和 PC 端复刻编码的结果比一下就能定性：
+            // 一样 → 报文没问题，502 出在设备到虎牙之间的某层；不一样 → 编码器有 bug。
+            AppLog.i("HuyaToken", "wup body len=${body.size} md5=${md5Hex(body)} stream=$name")
             var reason = ""
             for (attempt in attempts) {
                 val request = buildRequest(body, attempt.url)
@@ -188,6 +201,13 @@ internal object HuyaWupToken {
             .header("user-agent", NATIVE_USER_AGENT)
             .post(body.toRequestBody(CONTENT_TYPE))
             .build()
+
+    /** 报文摘要，用于和 PC 端复刻编码做逐字节比对。 */
+    private fun md5Hex(bytes: ByteArray): String =
+        java.security.MessageDigest
+            .getInstance("MD5")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     /** 失败时的诊断串：状态码 + 协议/TLS + 网关标识 + 响应体可打印前缀。 */
     private fun describe(response: Response): String {
