@@ -401,8 +401,8 @@ internal class ExoPlayerEngine(
                     val mediaSource = mediaSourceFactory.createMediaSource(MediaItem.fromUri(uri))
                     exoPlayer.setMediaSource(mediaSource)
                 }
-                // 短租约地址（虎牙 web FLV/HLS）在断流之前主动换签；native 凭据（huya_pc_exe）
-                // 不会被掐断，不需要切换。
+                // 短租约地址（虎牙 web 签名的 FLV 长连接）在断流之前主动换签；HLS 分片短连接
+                // 与 native 凭据（huya_pc_exe）都不会被掐断，不需要切换。
                 if (needsLeaseSwitch(url)) scheduleLeaseSwitch(url) else cancelLeaseSwitch()
             }
         }
@@ -477,7 +477,7 @@ internal class ExoPlayerEngine(
     /**
      * 短租约直播地址的「提前换签」。
      *
-     * 虎牙 web FLV/HLS 的连接在建立约 120 秒后被 CDN 主动断开。等 ENDED 再重连会有约 1 秒
+     * 虎牙 web 签名的 FLV 长连接在建立约 120 秒后被 CDN 主动断开。等 ENDED 再重连会有约 1 秒
      * 空档（播放器要把缓冲耗尽才判定结束），观感是「卡一下再跳一下」。这里在断流之前
      * （[LIVE_LEASE_SWITCH_MS]）就换到预取好的新地址：两边都是直播的当前画面，内容连续，
      * 只剩解码器重启的零点几秒；配合 PlayerView 的 keepContentOnPlayerReset 只是「停一帧」。
@@ -523,16 +523,20 @@ internal class ExoPlayerEngine(
     }
 
     /**
-     * 是否为「短传输租约」地址：虎牙域名下的 FLV/HLS，且不是 native 凭据
+     * 是否为「短传输租约」地址：虎牙域名下的 **FLV** 长连接，且不是 native 凭据
      * （`ctype=huya_pc_exe`）。判定与 PureLive 的 `hasShortTransportLease` 一致。
-     * 斗鱼（租约由 URL 的 `expire` 声明）与 B 站不属于此类。
+     *
+     * 刻意不包含 m3u8：HLS 是「取一次 playlist、再按分片各开一条短连接」，单条连接远远
+     * 到不了 120 秒，租约根本触发不到（实测同一份签名地址连续 233 秒仍正常出流）。
+     * 给 HLS 也排换签只会平白制造一次跳画面。斗鱼（租约由 URL 的 `expire` 声明）与 B 站
+     * 同样不属于此类。
      */
     private fun needsLeaseSwitch(url: String): Boolean {
         val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return false
         val host = uri.host?.lowercase(Locale.US).orEmpty()
         if (!host.contains("huya")) return false
         val path = uri.path?.lowercase(Locale.US).orEmpty()
-        if (!path.endsWith(".flv") && !path.endsWith(".m3u8")) return false
+        if (!path.endsWith(".flv")) return false
         return uri.getQueryParameter("ctype") != "huya_pc_exe"
     }
 
