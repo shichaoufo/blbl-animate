@@ -8,6 +8,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import android.os.SystemClock
 import okio.ByteString
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
@@ -50,6 +51,9 @@ class HuyaDanmakuClient(
     /** 诊断：收到多少帧 / 解出多少条弹幕，用来区分「没推」和「解不出来」。 */
     private val frameCount = AtomicInteger(0)
     private val chatCount = AtomicInteger(0)
+
+    /** 最近一次收到帧的时刻（elapsedRealtime），用于把「静默重连」从固定 180s 改成按需。 */
+    @Volatile private var lastFrameAtMs = 0L
 
     private var heartbeatTask: ScheduledFuture<*>? = null
     private var silenceTask: ScheduledFuture<*>? = null
@@ -124,14 +128,20 @@ class HuyaDanmakuClient(
             )
         // 兜底：长时间静默后重连（PureLive：max(3×60s, 90s) = 180s）。
         silenceTask?.cancel(true)
-        silenceTask =
-            scheduler.schedule(
-                {
-                    if (!closed) scheduleReconnect("silence timeout")
-                },
-                180,
-                TimeUnit.SECONDS,
-            )
+        silenceTask = scheduler.schedule({ checkSilence() }, SILENCE_CHECK_SEC, TimeUnit.SECONDS)
+    }
+
+    /** 最近 [SILENCE_RECONNECT_SEC] 内收到过帧就不重连，只在真正静默时重连。 */
+    private fun checkSilence() {
+        if (closed) return
+        val idleSec = (SystemClock.elapsedRealtime() - lastFrameAtMs) / 1000
+        if (lastFrameAtMs > 0L && idleSec < SILENCE_RECONNECT_SEC) {
+            val next = (SILENCE_RECONNECT_SEC - idleSec).coerceAtLeast(5L)
+            silenceTask = scheduler.schedule({ checkSilence() }, next, TimeUnit.SECONDS)
+            return
+        }
+        AppLog.w("HuyaWs", "silence ${idleSec}s >= ${SILENCE_RECONNECT_SEC}s -> reconnect")
+        scheduleReconnect("silence timeout")
     }
 
     private inner class Listener : WebSocketListener() {
@@ -144,7 +154,13 @@ class HuyaDanmakuClient(
             if (presenterUid <= 0L) {
                 AppLog.w("HuyaWs", "presenterUid=0 → 分组注册成 live:0/chat:0，服务端不会推这个房间")
             }
-            webSocket.send(ByteString.of(*register(presenterUid)))
+            val reg = register(presenterUid)
+            webSocket.send(ByteString.of(*reg))
+            AppLog.i(
+                "HuyaWs",
+                "register len=${reg.size} hex=" +
+                    reg.joinToString("") { "%02x".format(it.toInt() and 0xFF) },
+            )
             runCatching { ws?.send(ByteString.of(*heartbeat())) }
             startHeartbeat()
         }
@@ -154,10 +170,14 @@ class HuyaDanmakuClient(
             bytes: ByteString,
         ) {
             val n = frameCount.incrementAndGet()
-            if (n <= 5 || n % 50 == 0) {
-                AppLog.i("HuyaWs", "frame #$n len=${bytes.size} chats=${chatCount.get()}")
+            lastFrameAtMs = SystemClock.elapsedRealtime()
+            val raw = bytes.toByteArray()
+            if (n <= 12 || n % 40 == 0) {
+                val cmd = runCatching { Tars.int(Tars.decode(raw), 0) }.getOrNull()
+                val hex = if (n <= 6) " hex=" + raw.take(60).joinToString("") { "%02x".format(it.toInt() and 0xFF) } else ""
+                AppLog.i("HuyaWs", "frame #$n cmd=$cmd len=${raw.size} chats=${chatCount.get()}$hex")
             }
-            runCatching { handleFrame(bytes.toByteArray()) }
+            runCatching { handleFrame(raw) }
                 .onFailure { AppLog.w("HuyaWs", "handle frame failed", it) }
         }
 
@@ -252,6 +272,9 @@ class HuyaDanmakuClient(
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/90.0.4430.91 Mobile Safari/537.36"
+        /** 静默多久算死连接（原来是固定 180s 无条件重连）。 */
+        private const val SILENCE_RECONNECT_SEC = 180L
+        private const val SILENCE_CHECK_SEC = 60L
         private const val CMD_REGISTER = 16L
         private const val CMD_HEARTBEAT = 20L
         private const val CMD_PUSH = 7L
