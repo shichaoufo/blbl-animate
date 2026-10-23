@@ -12,6 +12,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.ByteArrayOutputStream
+import java.net.Proxy
 import java.util.concurrent.TimeUnit
 
 /**
@@ -54,14 +55,17 @@ internal object HuyaWupToken {
      * 两个 client：先按默认协议（会协商 HTTP/2），失败再强制 HTTP/1.1。
      *
      * 2026-10-23 真机日志里 wup 稳定返回 502，而同网络下用 curl / Python / Node(h2) 打同一
-     * 接口都是 200，说明差异在设备侧链路而不是报文。这里把「协议降级重试」作为兜底，并把
-     * 502 的响应头与响应体记进日志，便于下次直接看出是谁返回的。
+     * 接口都是 200（4 个节点全部 200），说明差异在设备侧链路而不是报文。这里做三件事：
+     * 强制直连、协议降级重试、失败时把 502 的响应头与响应体记进日志。
      */
     private val clients: List<Pair<String, OkHttpClient>> by lazy {
         val base =
             BiliClient.apiOkHttp
                 .newBuilder()
                 .cookieJar(CookieJar.NO_COOKIES)
+                // 强制直连：设备上常见的代理/分流（如 Clash 规则把 huya 走某个不健康节点）
+                // 会让这一个请求返回 502，而视频与房间接口是直连、看起来一切正常。
+                .proxy(Proxy.NO_PROXY)
                 .readTimeout(8, TimeUnit.SECONDS)
                 .writeTimeout(8, TimeUnit.SECONDS)
         listOf(
