@@ -10,6 +10,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import android.os.SystemClock
 import okio.ByteString
+import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ScheduledFuture
@@ -52,12 +53,35 @@ class HuyaDanmakuClient(
     private val frameCount = AtomicInteger(0)
     private val chatCount = AtomicInteger(0)
 
-    /** 最近一次收到帧的时刻（elapsedRealtime），用于把「静默重连」从固定 180s 改成按需。 */
+    /** 最近一次收到帧的时刻（elapsedRealtime）。只用于日志里区分「房间安静」和「连接已死」。 */
     @Volatile private var lastFrameAtMs = 0L
 
+    /** 连续几次心跳发送失败。到 [HEARTBEAT_MAX_FAILS] 才判定连接失效。 */
+    @Volatile private var heartbeatFailStreak = 0
+
+    /** 心跳序号，用于定期打一行「还活着」的日志。 */
+    private val heartbeatCount = AtomicInteger(0)
+
     private var heartbeatTask: ScheduledFuture<*>? = null
-    private var silenceTask: ScheduledFuture<*>? = null
     private var reconnectTask: ScheduledFuture<*>? = null
+
+    /**
+     * 虎牙专用的 WebSocket 客户端。
+     *
+     * [BiliClient.liveDanmakuOkHttp] 把 `pingInterval` 显式设成 0（B 站弹幕服务端自己会推心跳，
+     * 客户端 Ping 反而会干扰），但虎牙这条连接必须由客户端主动 Ping：
+     * 没有协议层 Ping/Pong，就分不清「房间安静没推送」和「TCP 已经半死」——
+     * 之前那个「静默 180s 无条件重连」就是这么来的，安静房间每 3 分钟自己断一次。
+     *
+     * 实测（2026-10-23，`ws_ping_probe.py`）虎牙服务端会正常回 Pong，
+     * 所以开启 20s Ping：**只有 Pong 超时（真死了）才触发 onFailure → 重连**。
+     */
+    private val wsClient by lazy {
+        BiliClient.liveDanmakuOkHttp
+            .newBuilder()
+            .pingInterval(WS_PING_INTERVAL_SEC, TimeUnit.SECONDS)
+            .build()
+    }
 
     override suspend fun connect() {
         closed = false
@@ -69,8 +93,7 @@ class HuyaDanmakuClient(
         if (closed) return
         heartbeatTask?.cancel(true)
         heartbeatTask = null
-        silenceTask?.cancel(true)
-        silenceTask = null
+        heartbeatFailStreak = 0
         runCatching { ws?.close(1000, "reconnect") }
         ws = null
 
@@ -83,15 +106,13 @@ class HuyaDanmakuClient(
                 .header("Origin", WEB)
                 .header("Referer", "$WEB/")
                 .build()
-        ws = BiliClient.liveDanmakuOkHttp.newWebSocket(req, Listener())
+        ws = wsClient.newWebSocket(req, Listener())
     }
 
     override fun close() {
         closed = true
         heartbeatTask?.cancel(true)
         heartbeatTask = null
-        silenceTask?.cancel(true)
-        silenceTask = null
         reconnectTask?.cancel(true)
         reconnectTask = null
         runCatching { ws?.close(1000, "bye") }
@@ -117,31 +138,61 @@ class HuyaDanmakuClient(
     private fun startHeartbeat() {
         if (closed) return
         heartbeatTask?.cancel(true)
+        heartbeatFailStreak = 0
         heartbeatTask =
             scheduler.scheduleWithFixedDelay(
-                {
-                    runCatching { ws?.send(ByteString.of(*heartbeat())) }
-                },
-                10,
-                60,
+                { sendHeartbeat() },
+                HEARTBEAT_FIRST_SEC,
+                HEARTBEAT_INTERVAL_SEC,
                 TimeUnit.SECONDS,
             )
-        // 兜底：长时间静默后重连（PureLive：max(3×60s, 90s) = 180s）。
-        silenceTask?.cancel(true)
-        silenceTask = scheduler.schedule({ checkSilence() }, SILENCE_CHECK_SEC, TimeUnit.SECONDS)
     }
 
-    /** 最近 [SILENCE_RECONNECT_SEC] 内收到过帧就不重连，只在真正静默时重连。 */
-    private fun checkSilence() {
+    /**
+     * 业务心跳（cmd 20）。
+     *
+     * **只有发送失败才算连接失效**。房间安静、服务端长时间不推帧都不是失败——
+     * 那是正常状态（三分钟没人说话的房间本来就不该有弹幕），
+     * 之前按「静默 180s」重连，等于每 3 分钟主动把好连接拆掉重建，
+     * 重连瞬间补一批初始消息，看起来就是「弹幕有一点又没了」。
+     *
+     * 连接真正半死（TCP 黑洞）由 [wsClient] 的 20s Ping/Pong 兜住：
+     * Pong 超时 OkHttp 会直接回调 onFailure，比这里更早、更准。
+     */
+    private fun sendHeartbeat() {
         if (closed) return
-        val idleSec = (SystemClock.elapsedRealtime() - lastFrameAtMs) / 1000
-        if (lastFrameAtMs > 0L && idleSec < SILENCE_RECONNECT_SEC) {
-            val next = (SILENCE_RECONNECT_SEC - idleSec).coerceAtLeast(5L)
-            silenceTask = scheduler.schedule({ checkSilence() }, next, TimeUnit.SECONDS)
+        val socket = ws
+        if (socket == null) {
+            scheduleReconnect("heartbeat: socket null")
             return
         }
-        AppLog.w("HuyaWs", "silence ${idleSec}s >= ${SILENCE_RECONNECT_SEC}s -> reconnect")
-        scheduleReconnect("silence timeout")
+        val sent = runCatching { socket.send(ByteString.of(*heartbeat())) }.getOrDefault(false)
+        if (!sent) {
+            heartbeatFailStreak++
+            AppLog.w(
+                "HuyaWs",
+                "heartbeat send failed ${heartbeatFailStreak}/${HEARTBEAT_MAX_FAILS} roomId=$roomId",
+            )
+            if (heartbeatFailStreak >= HEARTBEAT_MAX_FAILS) {
+                scheduleReconnect("heartbeat send failed x$heartbeatFailStreak")
+            }
+            return
+        }
+        heartbeatFailStreak = 0
+        val n = heartbeatCount.incrementAndGet()
+        if (n == 1 || n % HEARTBEAT_LOG_EVERY == 0) {
+            // idle 很大但心跳正常 = 房间真的安静，不重连。idle=never 表示连上后一帧都没推。
+            val idle =
+                if (lastFrameAtMs <= 0L) {
+                    "never"
+                } else {
+                    "${(SystemClock.elapsedRealtime() - lastFrameAtMs) / 1000}s"
+                }
+            AppLog.i(
+                "HuyaWs",
+                "heartbeat #$n ok idle=$idle frames=${frameCount.get()} chats=${chatCount.get()}",
+            )
+        }
     }
 
     private inner class Listener : WebSocketListener() {
@@ -150,6 +201,8 @@ class HuyaDanmakuClient(
             response: Response,
         ) {
             onStatus("虎牙弹幕已连接")
+            reconnectAttempt = 0
+            heartbeatFailStreak = 0
             AppLog.i("HuyaWs", "open room=$roomId register uid=$presenterUid code=${response.code}")
             // 诊断：把握手响应头落下来。PC 端用同样的报文能收到推送，设备端只有 cmd=17/21，
             // 需要看服务端在这条连接上回了什么（server / 有无 x- 头 / 是否被降级）。
@@ -200,9 +253,12 @@ class HuyaDanmakuClient(
             t: Throwable,
             response: Response?,
         ) {
+            // 只有真失败才走到这里：连接层异常，或 OkHttp 的 Ping 在 20s 内没等到 Pong
+            // （SocketTimeoutException）。房间安静不会触发。
+            val kind = if (t is SocketTimeoutException) "ping timeout" else t::class.java.simpleName
             onStatus("虎牙弹幕连接失败：${t.message}")
-            AppLog.w("HuyaWs", "onFailure roomId=$roomId", t)
-            scheduleReconnect("onFailure ${t::class.java.simpleName}")
+            AppLog.w("HuyaWs", "onFailure roomId=$roomId kind=$kind msg=${t.message}")
+            scheduleReconnect("onFailure $kind")
         }
 
         override fun onClosing(
@@ -286,9 +342,21 @@ class HuyaDanmakuClient(
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/90.0.4430.91 Mobile Safari/537.36"
-        /** 静默多久算死连接（原来是固定 180s 无条件重连）。 */
-        private const val SILENCE_RECONNECT_SEC = 180L
-        private const val SILENCE_CHECK_SEC = 60L
+        /**
+         * 协议层 Ping 间隔。虎牙服务端会回 Pong（实测 3/3 秒回），
+         * 因此这是「心跳失败」最可靠的判据：Pong 20s 内没等到 → OkHttp 直接回调 onFailure。
+         */
+        private const val WS_PING_INTERVAL_SEC = 20L
+
+        /** 业务心跳（cmd 20）：建连 10s 后第一次，之后每 60s 一次。 */
+        private const val HEARTBEAT_FIRST_SEC = 10L
+        private const val HEARTBEAT_INTERVAL_SEC = 60L
+
+        /** 连续这么多次心跳发送失败才重连（一次失败可能只是发送队列瞬时拥塞）。 */
+        private const val HEARTBEAT_MAX_FAILS = 2
+
+        /** 每 N 次心跳打一行「连接还活着」的日志（安静房间排查用）。 */
+        private const val HEARTBEAT_LOG_EVERY = 5
         private const val CMD_REGISTER = 16L
         private const val CMD_HEARTBEAT = 20L
         private const val CMD_PUSH = 7L
