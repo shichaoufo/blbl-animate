@@ -389,11 +389,14 @@ internal object HuyaWupToken {
         body.emptyMap(10)
         val raw = body.toByteArray()
 
-        val framed = ByteArrayOutputStream(raw.size + 4)
-        framed.write((raw.size ushr 24) and 0xFF)
-        framed.write((raw.size ushr 16) and 0xFF)
-        framed.write((raw.size ushr 8) and 0xFF)
-        framed.write(raw.size and 0xFF)
+        // TUP3 的 4 字节长度字段 = 整个报文长度（含这 4 字节自身）。
+        // 之前写成 raw.size（少了 4），网关按「报文截断」处理，一律回 502 Bad Gateway。
+        val total = raw.size + 4
+        val framed = ByteArrayOutputStream(total)
+        framed.write((total ushr 24) and 0xFF)
+        framed.write((total ushr 16) and 0xFF)
+        framed.write((total ushr 8) and 0xFF)
+        framed.write(total and 0xFF)
         framed.write(raw)
         return framed.toByteArray()
     }
